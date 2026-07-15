@@ -156,22 +156,17 @@ impl ScrollResult {
 }
 
 /// Scroll mode for Python-compatible API
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScrollMode {
     /// Move to first row
     First,
     /// Move to last row
     Last,
     /// Move relative to current position (default)
+    #[default]
     Relative,
     /// Move to absolute position
     Absolute,
-}
-
-impl Default for ScrollMode {
-    fn default() -> Self {
-        Self::Relative
-    }
 }
 
 impl From<ScrollMode> for FetchOrientation {
@@ -225,16 +220,27 @@ mod tests {
 
     #[test]
     fn test_scroll_mode_conversion() {
-        assert_eq!(FetchOrientation::from(ScrollMode::First), FetchOrientation::First);
-        assert_eq!(FetchOrientation::from(ScrollMode::Last), FetchOrientation::Last);
-        assert_eq!(FetchOrientation::from(ScrollMode::Relative), FetchOrientation::Relative);
-        assert_eq!(FetchOrientation::from(ScrollMode::Absolute), FetchOrientation::Absolute);
+        assert_eq!(
+            FetchOrientation::from(ScrollMode::First),
+            FetchOrientation::First
+        );
+        assert_eq!(
+            FetchOrientation::from(ScrollMode::Last),
+            FetchOrientation::Last
+        );
+        assert_eq!(
+            FetchOrientation::from(ScrollMode::Relative),
+            FetchOrientation::Relative
+        );
+        assert_eq!(
+            FetchOrientation::from(ScrollMode::Absolute),
+            FetchOrientation::Absolute
+        );
     }
 
     #[test]
     fn test_scrollable_cursor_options() {
-        let opts = ScrollableCursorOptions::new()
-            .with_array_size(50);
+        let opts = ScrollableCursorOptions::new().with_array_size(50);
         assert_eq!(opts.array_size, 50);
     }
 }

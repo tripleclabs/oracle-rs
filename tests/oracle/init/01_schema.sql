@@ -1,8 +1,26 @@
 -- Schema setup for oracle-rs integration tests
--- Init scripts run as SYS on the CDB, so we must switch to the PDB
--- and create objects under the app user's schema.
+-- Init scripts run as SYS. Oracle 11g XE has no PDBs, while newer
+-- gvenzl images run scripts from the CDB root and need a PDB switch.
 
-ALTER SESSION SET CONTAINER = FREEPDB1;
+DECLARE
+    pdb_count NUMBER := 0;
+BEGIN
+    EXECUTE IMMEDIATE q'[
+        SELECT COUNT(*)
+          FROM v$containers
+         WHERE name = 'FREEPDB1'
+    ]' INTO pdb_count;
+
+    IF pdb_count > 0 THEN
+        EXECUTE IMMEDIATE 'ALTER SESSION SET CONTAINER = FREEPDB1';
+    END IF;
+EXCEPTION
+    WHEN OTHERS THEN
+        IF SQLCODE != -942 THEN
+            RAISE;
+        END IF;
+END;
+/
 
 -- Create objects as TESTUSER
 -- (APP_USER is created automatically by the container entrypoint)

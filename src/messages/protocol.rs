@@ -70,27 +70,40 @@ impl ProtocolMessage {
     ///
     /// # Arguments
     /// * `large_sdu` - Whether to use large SDU format (4-byte length) for the packet header
-    pub fn build_request(&self, large_sdu: bool) -> Result<Bytes> {
+    pub fn build_request(&self, caps: &Capabilities, large_sdu: bool) -> Result<Bytes> {
         let mut buf = WriteBuffer::with_capacity(128);
 
         // Reserve space for packet header
         buf.write_zeros(PACKET_HEADER_SIZE)?;
 
-        // Data flags (2 bytes)
-        buf.write_u16_be(0)?;
+        if caps.protocol_version == crate::constants::version::MIN_ACCEPTED {
+            // Oracle 11g expects the legacy Set Protocol layout captured from OCI:
+            // accepted TTC versions followed by the client platform string.
+            buf.write_u16_be(0x2000)?;
+            buf.write_u8(MessageType::Protocol as u8)?;
+            buf.write_u8(7)?;
+            buf.write_u8(6)?;
+            buf.write_u8(5)?;
+            buf.write_u8(0)?;
+            buf.write_bytes(Self::legacy_11g_client_platform().as_bytes())?;
+            buf.write_u8(0)?;
+        } else {
+            // Data flags (2 bytes)
+            buf.write_u16_be(0)?;
 
-        // Message type
-        buf.write_u8(MessageType::Protocol as u8)?;
+            // Message type
+            buf.write_u8(MessageType::Protocol as u8)?;
 
-        // Protocol version (8.1 and higher)
-        buf.write_u8(6)?;
+            // Protocol version (8.1 and higher)
+            buf.write_u8(6)?;
 
-        // Array terminator
-        buf.write_u8(0)?;
+            // Array terminator
+            buf.write_u8(0)?;
 
-        // Driver name (null-terminated)
-        buf.write_bytes(DRIVER_NAME.as_bytes())?;
-        buf.write_u8(0)?;
+            // Driver name (null-terminated)
+            buf.write_bytes(DRIVER_NAME.as_bytes())?;
+            buf.write_u8(0)?;
+        }
 
         // Calculate total length and write header
         let total_len = buf.len() as u32;
@@ -161,6 +174,13 @@ impl ProtocolMessage {
         // Server compile capabilities (length-prefixed)
         self.server_compile_caps = buf.read_bytes_with_length()?;
         if let Some(ref server_ccaps) = self.server_compile_caps {
+            if std::env::var_os("ORACLE_RS_DEBUG_HANDSHAKE").is_some() {
+                eprintln!(
+                    "oracle-rs server_compile_caps ({} bytes): {:?}",
+                    server_ccaps.len(),
+                    server_ccaps,
+                );
+            }
             caps.adjust_for_server_compile_caps(server_ccaps);
         }
 
@@ -185,6 +205,10 @@ impl ProtocolMessage {
         }
         Ok(String::from_utf8_lossy(&bytes).to_string())
     }
+
+    fn legacy_11g_client_platform() -> String {
+        "MACOS_aarch64/OSX-22.3.0-Darwin".to_string()
+    }
 }
 
 impl Default for ProtocolMessage {
@@ -199,8 +223,9 @@ mod tests {
 
     #[test]
     fn test_build_protocol_request() {
+        let caps = Capabilities::new();
         let msg = ProtocolMessage::new();
-        let packet = msg.build_request(false).unwrap();
+        let packet = msg.build_request(&caps, false).unwrap();
 
         // Check header
         assert!(packet.len() > PACKET_HEADER_SIZE);
@@ -215,6 +240,23 @@ mod tests {
         // Check driver name is in the packet
         let packet_str = String::from_utf8_lossy(&packet);
         assert!(packet_str.contains("oracle-rs"));
+    }
+
+    #[test]
+    fn test_build_legacy_11g_protocol_request() {
+        let mut caps = Capabilities::new();
+        caps.protocol_version = 314;
+
+        let msg = ProtocolMessage::new();
+        let packet = msg.build_request(&caps, false).unwrap();
+
+        assert_eq!(
+            hex::encode(packet),
+            concat!(
+                "002f00000600000020000107060500",
+                "4d41434f535f616172636836342f4f53582d32322e332e302d44617277696e00",
+            )
+        );
     }
 
     #[test]
@@ -262,10 +304,7 @@ mod tests {
         assert!(result.is_ok());
 
         assert_eq!(msg.server_version, 6);
-        assert_eq!(
-            msg.server_banner.as_deref(),
-            Some("Oracle Database 19c")
-        );
+        assert_eq!(msg.server_banner.as_deref(), Some("Oracle Database 19c"));
         assert_eq!(caps.charset_id, 873);
     }
 

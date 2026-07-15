@@ -3,7 +3,9 @@
 //! These tests verify the O5LOGON authentication protocol implementation
 //! without requiring an actual Oracle database connection.
 
-use oracle_rs::constants::{auth_mode, verifier_type, FunctionCode, PacketType, PACKET_HEADER_SIZE};
+use oracle_rs::constants::{
+    auth_mode, verifier_type, FunctionCode, PacketType, PACKET_HEADER_SIZE,
+};
 use oracle_rs::crypto::{
     encrypt_cbc_192, encrypt_cbc_256, generate_11g_password_hash, generate_12c_password_hash,
     pbkdf2_derive,
@@ -283,7 +285,10 @@ mod session_data_tests {
     #[test]
     fn test_session_data_invalid_numbers() {
         let mut pairs = HashMap::new();
-        pairs.insert("AUTH_PBKDF2_VGEN_COUNT".to_string(), "not_a_number".to_string());
+        pairs.insert(
+            "AUTH_PBKDF2_VGEN_COUNT".to_string(),
+            "not_a_number".to_string(),
+        );
 
         let data = SessionData::from_pairs(&pairs);
         assert!(data.auth_pbkdf2_vgen_count.is_none());

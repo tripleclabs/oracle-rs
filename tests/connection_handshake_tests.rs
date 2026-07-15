@@ -11,10 +11,7 @@ use oracle_rs::Config;
 
 /// Helper to create a mock packet with the given type and payload
 fn make_packet(packet_type: PacketType, payload: &[u8]) -> Packet {
-    let header = PacketHeader::new(
-        packet_type,
-        (PACKET_HEADER_SIZE + payload.len()) as u32,
-    );
+    let header = PacketHeader::new(packet_type, (PACKET_HEADER_SIZE + payload.len()) as u32);
     Packet::new(header, Bytes::copy_from_slice(payload))
 }
 
@@ -108,8 +105,8 @@ mod accept_message_tests {
             0x00, 0x00, // Hardware byte order
             0x00, 0x00, // Data length: 0
             0x00, 0x00, // Data offset: 0
-            0x04,       // Flags 0: DISABLE_NA
-            0x04,       // Flags 1
+            0x04, // Flags 0: DISABLE_NA
+            0x04, // Flags 1
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Reserved
             0x00, 0x00, 0x80, 0x00, // SDU 32-bit: 32768
             0x00, 0x00, 0x00, 0x00, 0x00, // Reserved
@@ -136,8 +133,8 @@ mod accept_message_tests {
             0x00, 0x00, // Hardware byte order
             0x00, 0x00, // Data length: 0
             0x00, 0x00, // Data offset: 0
-            0x04,       // Flags 0
-            0x04,       // Flags 1
+            0x04, // Flags 0
+            0x04, // Flags 1
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Reserved
             0x00, 0x00, 0x20, 0x00, // SDU 32-bit: 8192
         ];
@@ -182,8 +179,8 @@ mod accept_message_tests {
             0x00, 0x00, // Hardware byte order
             0x00, 0x00, // Data length
             0x00, 0x00, // Data offset
-            0x10,       // Flags 0: NA_REQUIRED
-            0x00,       // Flags 1
+            0x10, // Flags 0: NA_REQUIRED
+            0x00, // Flags 1
         ];
 
         let packet = make_packet(PacketType::Accept, &payload);
@@ -191,7 +188,10 @@ mod accept_message_tests {
 
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err, oracle_rs::Error::NativeNetworkEncryptionRequired));
+        assert!(matches!(
+            err,
+            oracle_rs::Error::NativeNetworkEncryptionRequired
+        ));
     }
 
     #[test]
@@ -379,8 +379,8 @@ mod connection_flow_tests {
             0x00, 0x00, // Hardware byte order
             0x00, 0x00, // Data length: 0
             0x00, 0x00, // Data offset: 0
-            0x04,       // Flags 0: DISABLE_NA
-            0x04,       // Flags 1
+            0x04, // Flags 0: DISABLE_NA
+            0x04, // Flags 1
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Reserved
             0x00, 0x00, 0x40, 0x00, // SDU 32-bit: 16384
             0x00, 0x00, 0x00, 0x00, 0x00, // Reserved

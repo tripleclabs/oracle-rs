@@ -1,19 +1,27 @@
 //! Integration tests for Oracle-RS against a real Oracle database
 //!
-//! These tests require a running Oracle instance. The easiest way is to use
-//! the included Docker Compose setup:
+//! These tests require a running Oracle instance. The included Docker Compose
+//! setup starts BOTH supported server versions side by side so the tests can be
+//! run against each:
+//!
+//! * `oracle`    - gvenzl/oracle-xe:11-slim  (Oracle 11g XE), host port 1521, service XE
+//! * `oracle23`  - gvenzl/oracle-free:slim   (Oracle 23ai Free), host port 1522, service FREEPDB1
 //!
 //! ```sh
-//! # Start Oracle (takes ~2 minutes on first run)
+//! # Start both Oracle versions (first run pulls images + inits, several minutes)
 //! docker compose -f tests/oracle/docker-compose.yml up -d
 //!
 //! # Wait for healthy status
-//! docker compose -f tests/oracle/docker-compose.yml logs -f
+//! docker compose -f tests/oracle/docker-compose.yml ps
 //!
-//! # Run integration tests (no env vars needed with defaults)
+//! # Run integration tests against 11g (defaults: port 1521, service XE)
 //! cargo test --test integration_tests -- --ignored
 //!
-//! # Stop Oracle
+//! # Run integration tests against 23ai (port 1522, service FREEPDB1)
+//! ORACLE_PORT=1522 ORACLE_SERVICE=FREEPDB1 \
+//!     cargo test --test integration_tests -- --ignored
+//!
+//! # Stop both
 //! docker compose -f tests/oracle/docker-compose.yml down
 //! ```
 //!
@@ -27,7 +35,7 @@
 //! Option 2 - Individual parameters:
 //!   ORACLE_HOST: Oracle host (default: localhost)
 //!   ORACLE_PORT: Oracle port (default: 1521)
-//!   ORACLE_SERVICE: Oracle service name (default: FREEPDB1)
+//!   ORACLE_SERVICE: Oracle service name (default: XE)
 //!   ORACLE_USER: Oracle username (default: testuser)
 //!   ORACLE_PASSWORD: Oracle password (default: testpass)
 
@@ -46,7 +54,8 @@ fn get_test_config() -> Config {
 
     // Check for connection string first
     if let Ok(connect_string) = std::env::var("ORACLE_CONNECT_STRING") {
-        let mut config: Config = connect_string.parse()
+        let mut config: Config = connect_string
+            .parse()
             .expect("Failed to parse ORACLE_CONNECT_STRING");
         config.set_username(&username);
         config.set_password(&password);
@@ -59,7 +68,7 @@ fn get_test_config() -> Config {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(1521);
-    let service = std::env::var("ORACLE_SERVICE").unwrap_or_else(|_| "FREEPDB1".to_string());
+    let service = std::env::var("ORACLE_SERVICE").unwrap_or_else(|_| "XE".to_string());
 
     Config::new(&host, port, &service, &username, &password)
 }
@@ -68,6 +77,23 @@ fn get_test_config() -> Config {
 async fn connect() -> Result<Connection, Error> {
     let config = get_test_config();
     Connection::connect_with_config(config).await
+}
+
+async fn supports_array_dml_row_counts(conn: &Connection) -> bool {
+    conn.server_info().await.protocol_version > 314
+}
+
+async fn is_oracle_11g(conn: &Connection) -> bool {
+    conn.server_info().await.protocol_version <= 314
+}
+
+async fn skip_on_11g(conn: &Connection, feature: &str) -> bool {
+    if is_oracle_11g(conn).await {
+        eprintln!("Skipping {} on Oracle 11g", feature);
+        true
+    } else {
+        false
+    }
 }
 
 mod connection_tests {
@@ -101,7 +127,7 @@ mod connection_tests {
             .ok()
             .and_then(|p| p.parse().ok())
             .unwrap_or(1521);
-        let service = std::env::var("ORACLE_SERVICE").unwrap_or_else(|_| "FREEPDB1".to_string());
+        let service = std::env::var("ORACLE_SERVICE").unwrap_or_else(|_| "XE".to_string());
 
         let mut config = Config::new(&host, port, &service, "invalid_user", "invalid_pass");
         config.set_password("invalid_pass");
@@ -118,12 +144,13 @@ mod connection_tests {
             .ok()
             .and_then(|p| p.parse().ok())
             .unwrap_or(1521);
-        let service = std::env::var("ORACLE_SERVICE").unwrap_or_else(|_| "FREEPDB1".to_string());
+        let service = std::env::var("ORACLE_SERVICE").unwrap_or_else(|_| "XE".to_string());
         let username = std::env::var("ORACLE_USER").unwrap_or_else(|_| "testuser".to_string());
         let password = std::env::var("ORACLE_PASSWORD").unwrap_or_else(|_| "testpass".to_string());
 
         let connect_string = format!("{}:{}/{}", host, port, service);
-        let conn = Connection::connect(&connect_string, &username, &password).await
+        let conn = Connection::connect(&connect_string, &username, &password)
+            .await
             .expect("Failed to connect with connection string");
 
         conn.close().await.expect("Failed to close");
@@ -138,8 +165,26 @@ mod query_tests {
     async fn test_simple_query() {
         let conn = connect().await.expect("Failed to connect");
 
-        let result = conn.query("SELECT 1 FROM DUAL", &[]).await
+        let result = conn
+            .query("SELECT 1 FROM DUAL", &[])
+            .await
             .expect("Query failed");
+
+        assert_eq!(result.row_count(), 1);
+        assert!(!result.is_empty());
+
+        conn.close().await.expect("Failed to close");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Oracle database"]
+    async fn test_execute_select_returns_rows() {
+        let conn = connect().await.expect("Failed to connect");
+
+        let result = conn
+            .execute("SELECT 1 FROM DUAL", &[])
+            .await
+            .expect("Execute SELECT failed");
 
         assert_eq!(result.row_count(), 1);
         assert!(!result.is_empty());
@@ -152,7 +197,9 @@ mod query_tests {
     async fn test_sysdate_query() {
         let conn = connect().await.expect("Failed to connect");
 
-        let result = conn.query("SELECT SYSDATE FROM DUAL", &[]).await
+        let result = conn
+            .query("SELECT SYSDATE FROM DUAL", &[])
+            .await
             .expect("Query failed");
 
         assert_eq!(result.row_count(), 1);
@@ -166,7 +213,9 @@ mod query_tests {
     async fn test_string_query() {
         let conn = connect().await.expect("Failed to connect");
 
-        let result = conn.query("SELECT 'Hello World' AS greeting FROM DUAL", &[]).await
+        let result = conn
+            .query("SELECT 'Hello World' AS greeting FROM DUAL", &[])
+            .await
             .expect("Query failed");
 
         assert_eq!(result.row_count(), 1);
@@ -180,10 +229,10 @@ mod query_tests {
     async fn test_multiple_columns() {
         let conn = connect().await.expect("Failed to connect");
 
-        let result = conn.query(
-            "SELECT 1 AS col1, 2 AS col2, 'test' AS col3 FROM DUAL",
-            &[]
-        ).await.expect("Query failed");
+        let result = conn
+            .query("SELECT 1 AS col1, 2 AS col2, 'test' AS col3 FROM DUAL", &[])
+            .await
+            .expect("Query failed");
 
         assert_eq!(result.row_count(), 1);
         assert_eq!(result.column_count(), 3);
@@ -199,10 +248,13 @@ mod query_tests {
     async fn test_query_departments_table() {
         let conn = connect().await.expect("Failed to connect");
 
-        let result = conn.query(
-            "SELECT dept_id, dept_name FROM test_departments ORDER BY dept_id",
-            &[]
-        ).await.expect("Query failed");
+        let result = conn
+            .query(
+                "SELECT dept_id, dept_name FROM test_departments ORDER BY dept_id",
+                &[],
+            )
+            .await
+            .expect("Query failed");
 
         assert_eq!(result.row_count(), 5);
         assert_eq!(result.column_count(), 2);
@@ -217,10 +269,13 @@ mod query_tests {
     async fn test_query_employees_table() {
         let conn = connect().await.expect("Failed to connect");
 
-        let result = conn.query(
-            "SELECT emp_id, first_name, last_name, salary FROM test_employees ORDER BY emp_id",
-            &[]
-        ).await.expect("Query failed");
+        let result = conn
+            .query(
+                "SELECT emp_id, first_name, last_name, salary FROM test_employees ORDER BY emp_id",
+                &[],
+            )
+            .await
+            .expect("Query failed");
 
         assert_eq!(result.row_count(), 6);
         assert!(result.column_by_name("EMP_ID").is_some());
@@ -236,10 +291,10 @@ mod query_tests {
     async fn test_query_with_where_clause() {
         let conn = connect().await.expect("Failed to connect");
 
-        let result = conn.query(
-            "SELECT * FROM test_employees WHERE dept_id = 1",
-            &[]
-        ).await.expect("Query failed");
+        let result = conn
+            .query("SELECT * FROM test_employees WHERE dept_id = 1", &[])
+            .await
+            .expect("Query failed");
 
         // Engineering department has 2 employees
         assert_eq!(result.row_count(), 2);
@@ -253,10 +308,10 @@ mod query_tests {
         let conn = connect().await.expect("Failed to connect");
 
         // Employee with NULL email
-        let result = conn.query(
-            "SELECT email FROM test_employees WHERE emp_id = 5",
-            &[]
-        ).await.expect("Query failed");
+        let result = conn
+            .query("SELECT email FROM test_employees WHERE emp_id = 5", &[])
+            .await
+            .expect("Query failed");
 
         assert_eq!(result.row_count(), 1);
 
@@ -268,10 +323,10 @@ mod query_tests {
     async fn test_empty_result_set() {
         let conn = connect().await.expect("Failed to connect");
 
-        let result = conn.query(
-            "SELECT * FROM test_employees WHERE emp_id = 99999",
-            &[]
-        ).await.expect("Query failed");
+        let result = conn
+            .query("SELECT * FROM test_employees WHERE emp_id = 99999", &[])
+            .await
+            .expect("Query failed");
 
         assert!(result.is_empty());
         assert_eq!(result.row_count(), 0);
@@ -288,10 +343,13 @@ mod data_type_tests {
     async fn test_number_data_type() {
         let conn = connect().await.expect("Failed to connect");
 
-        let result = conn.query(
-            "SELECT val_integer, val_number FROM test_data_types WHERE id = 1",
-            &[]
-        ).await.expect("Query failed");
+        let result = conn
+            .query(
+                "SELECT val_integer, val_number FROM test_data_types WHERE id = 1",
+                &[],
+            )
+            .await
+            .expect("Query failed");
 
         assert_eq!(result.row_count(), 1);
 
@@ -303,10 +361,10 @@ mod data_type_tests {
     async fn test_varchar_data_type() {
         let conn = connect().await.expect("Failed to connect");
 
-        let result = conn.query(
-            "SELECT val_varchar FROM test_data_types WHERE id = 1",
-            &[]
-        ).await.expect("Query failed");
+        let result = conn
+            .query("SELECT val_varchar FROM test_data_types WHERE id = 1", &[])
+            .await
+            .expect("Query failed");
 
         assert_eq!(result.row_count(), 1);
 
@@ -318,10 +376,10 @@ mod data_type_tests {
     async fn test_date_data_type() {
         let conn = connect().await.expect("Failed to connect");
 
-        let result = conn.query(
-            "SELECT val_date FROM test_data_types WHERE id = 1",
-            &[]
-        ).await.expect("Query failed");
+        let result = conn
+            .query("SELECT val_date FROM test_data_types WHERE id = 1", &[])
+            .await
+            .expect("Query failed");
 
         assert_eq!(result.row_count(), 1);
 
@@ -333,10 +391,13 @@ mod data_type_tests {
     async fn test_timestamp_data_type() {
         let conn = connect().await.expect("Failed to connect");
 
-        let result = conn.query(
-            "SELECT val_timestamp FROM test_data_types WHERE id = 1",
-            &[]
-        ).await.expect("Query failed");
+        let result = conn
+            .query(
+                "SELECT val_timestamp FROM test_data_types WHERE id = 1",
+                &[],
+            )
+            .await
+            .expect("Query failed");
 
         assert_eq!(result.row_count(), 1);
 
@@ -382,7 +443,7 @@ mod data_type_tests {
     #[tokio::test]
     #[ignore = "requires Oracle database"]
     async fn test_clob_read_content() {
-        use oracle_rs::{Value, LobData};
+        use oracle_rs::{LobData, Value};
 
         let conn = connect().await.expect("Failed to connect");
 
@@ -408,7 +469,11 @@ mod data_type_tests {
                 match data {
                     LobData::String(s) => {
                         // Database has "This is a CLOB value" (20 chars)
-                        assert!(s.starts_with("This is a CLOB"), "CLOB content should start with 'This is a CLOB', got: {:?}", s);
+                        assert!(
+                            s.starts_with("This is a CLOB"),
+                            "CLOB content should start with 'This is a CLOB', got: {:?}",
+                            s
+                        );
                         assert!(!s.is_empty(), "CLOB content should not be empty");
                     }
                     LobData::Bytes(_) => {
@@ -444,7 +509,10 @@ mod data_type_tests {
                 let locator = lob.as_locator().expect("Expected LOB locator");
 
                 // Get the LOB length using the lob_length operation
-                let length = conn.lob_length(locator).await.expect("Failed to get LOB length");
+                let length = conn
+                    .lob_length(locator)
+                    .await
+                    .expect("Failed to get LOB length");
 
                 // The CLOB content is "This is a CLOB value" which is 20 characters
                 // But it might be stored differently, so just check it's > 0
@@ -452,7 +520,10 @@ mod data_type_tests {
 
                 // Also verify it matches the size we got from metadata
                 if let Some(meta_size) = lob.size() {
-                    assert_eq!(length, meta_size, "Length from lob_length should match metadata size");
+                    assert_eq!(
+                        length, meta_size,
+                        "Length from lob_length should match metadata size"
+                    );
                 }
             }
             _ => panic!("Expected LOB value, got {:?}", lob_value),
@@ -470,7 +541,10 @@ mod data_type_tests {
 
         // Query the CLOB to get its locator
         let result = conn
-            .query("SELECT val_clob FROM test_data_types WHERE id = 1 FOR UPDATE", &[])
+            .query(
+                "SELECT val_clob FROM test_data_types WHERE id = 1 FOR UPDATE",
+                &[],
+            )
             .await
             .expect("Query failed");
 
@@ -484,12 +558,17 @@ mod data_type_tests {
                 let locator = lob.as_locator().expect("Expected LOB locator");
 
                 // Read the original content
-                let original = conn.read_clob(locator).await.expect("Failed to read original CLOB");
+                let original = conn
+                    .read_clob(locator)
+                    .await
+                    .expect("Failed to read original CLOB");
                 eprintln!("[TEST] Original CLOB content: {:?}", original);
 
                 // Write new content at offset 1 (1-based, so this overwrites from the beginning)
                 let new_text = "Hello, Oracle!";
-                conn.write_clob(locator, 1, new_text).await.expect("Failed to write CLOB");
+                conn.write_clob(locator, 1, new_text)
+                    .await
+                    .expect("Failed to write CLOB");
 
                 // Do a fresh SELECT to get a new locator and verify data
                 // Note: Reading with the old locator returns cached data, so we need a fresh locator
@@ -501,13 +580,24 @@ mod data_type_tests {
                 let fresh_lob = fresh_row.values().get(0).expect("Missing fresh CLOB");
 
                 if let Value::Lob(fresh_lob_val) = fresh_lob {
-                    let fresh_locator = fresh_lob_val.as_locator().expect("Expected fresh LOB locator");
-                    let written = conn.read_clob(fresh_locator).await.expect("Failed to read written CLOB");
-                    eprintln!("[TEST] After write CLOB content (fresh locator): {:?}", written);
+                    let fresh_locator = fresh_lob_val
+                        .as_locator()
+                        .expect("Expected fresh LOB locator");
+                    let written = conn
+                        .read_clob(fresh_locator)
+                        .await
+                        .expect("Failed to read written CLOB");
+                    eprintln!(
+                        "[TEST] After write CLOB content (fresh locator): {:?}",
+                        written
+                    );
 
                     // The written content should start with our new text
-                    assert!(written.starts_with("Hello, Oracle!"),
-                        "Written CLOB should start with 'Hello, Oracle!', got: {:?}", written);
+                    assert!(
+                        written.starts_with("Hello, Oracle!"),
+                        "Written CLOB should start with 'Hello, Oracle!', got: {:?}",
+                        written
+                    );
                 } else {
                     panic!("Expected fresh LOB value, got {:?}", fresh_lob);
                 }
@@ -538,8 +628,14 @@ mod data_type_tests {
             .expect("Failed to insert test data");
 
         // Verify the content before PL/SQL trim
-        let result = conn.query("SELECT val_clob FROM temp_lob_test WHERE id = 1", &[]).await.expect("Query failed");
-        eprintln!("[TEST] Before PL/SQL trim: {:?}", result.rows.first().map(|r| r.values().get(0)));
+        let result = conn
+            .query("SELECT val_clob FROM temp_lob_test WHERE id = 1", &[])
+            .await
+            .expect("Query failed");
+        eprintln!(
+            "[TEST] Before PL/SQL trim: {:?}",
+            result.rows.first().map(|r| r.values().get(0))
+        );
 
         // Use PL/SQL to trim
         conn.execute("DECLARE l_clob CLOB; BEGIN SELECT val_clob INTO l_clob FROM temp_lob_test WHERE id = 1 FOR UPDATE; DBMS_LOB.TRIM(l_clob, 5); END;", &[])
@@ -547,8 +643,14 @@ mod data_type_tests {
             .expect("PL/SQL trim failed");
 
         // Check result
-        let result = conn.query("SELECT val_clob FROM temp_lob_test WHERE id = 1", &[]).await.expect("Query failed");
-        eprintln!("[TEST] After PL/SQL trim: {:?}", result.rows.first().map(|r| r.values().get(0)));
+        let result = conn
+            .query("SELECT val_clob FROM temp_lob_test WHERE id = 1", &[])
+            .await
+            .expect("Query failed");
+        eprintln!(
+            "[TEST] After PL/SQL trim: {:?}",
+            result.rows.first().map(|r| r.values().get(0))
+        );
 
         conn.rollback().await.expect("Failed to rollback");
         conn.close().await.expect("Failed to close");
@@ -596,15 +698,29 @@ mod data_type_tests {
                 eprintln!("[TEST] LOB size from metadata: {}", original_size);
 
                 // Read original content
-                let original_content = conn.read_blob(locator).await.expect("Failed to read original BLOB");
-                eprintln!("[TEST] Original BLOB first 20 bytes: {:02x?}", &original_content[..std::cmp::min(20, original_content.len())]);
+                let original_content = conn
+                    .read_blob(locator)
+                    .await
+                    .expect("Failed to read original BLOB");
+                eprintln!(
+                    "[TEST] Original BLOB first 20 bytes: {:02x?}",
+                    &original_content[..std::cmp::min(20, original_content.len())]
+                );
 
                 // Write "Hello" at offset 1 (1-based) - raw bytes for BLOB
-                conn.write_blob(locator, 1, b"Hello").await.expect("Failed to write BLOB");
+                conn.write_blob(locator, 1, b"Hello")
+                    .await
+                    .expect("Failed to write BLOB");
 
                 // Read using same locator
-                let content_same_locator = conn.read_blob(locator).await.expect("Failed to read written BLOB");
-                eprintln!("[TEST] After write (same locator) first 20 bytes: {:02x?}", &content_same_locator[..std::cmp::min(20, content_same_locator.len())]);
+                let content_same_locator = conn
+                    .read_blob(locator)
+                    .await
+                    .expect("Failed to read written BLOB");
+                eprintln!(
+                    "[TEST] After write (same locator) first 20 bytes: {:02x?}",
+                    &content_same_locator[..std::cmp::min(20, content_same_locator.len())]
+                );
 
                 // Do a fresh SELECT to get a new locator and verify data
                 // Note: Reading with the old locator returns cached data, so we need a fresh locator
@@ -615,11 +731,23 @@ mod data_type_tests {
                 let fresh_row = &fresh_result.rows[0];
                 let fresh_lob = fresh_row.values().get(0).expect("Missing fresh LOB");
                 if let Value::Lob(fresh_lob_val) = fresh_lob {
-                    let fresh_locator = fresh_lob_val.as_locator().expect("Expected fresh LOB locator");
-                    let content = conn.read_blob(fresh_locator).await.expect("Failed to read fresh BLOB");
-                    eprintln!("[TEST] After write (fresh locator) first 20 bytes: {:02x?}", &content[..std::cmp::min(20, content.len())]);
+                    let fresh_locator = fresh_lob_val
+                        .as_locator()
+                        .expect("Expected fresh LOB locator");
+                    let content = conn
+                        .read_blob(fresh_locator)
+                        .await
+                        .expect("Failed to read fresh BLOB");
+                    eprintln!(
+                        "[TEST] After write (fresh locator) first 20 bytes: {:02x?}",
+                        &content[..std::cmp::min(20, content.len())]
+                    );
                     // Should start with "Hello" bytes since we wrote at the beginning
-                    assert!(content.starts_with(b"Hello"), "Content should start with 'Hello' bytes, got first 20: {:02x?}", &content[..std::cmp::min(20, content.len())]);
+                    assert!(
+                        content.starts_with(b"Hello"),
+                        "Content should start with 'Hello' bytes, got first 20: {:02x?}",
+                        &content[..std::cmp::min(20, content.len())]
+                    );
                 } else {
                     panic!("Expected fresh LOB value");
                 }
@@ -654,13 +782,19 @@ mod data_type_tests {
             .ok();
 
         // Insert test data with a BLOB (small initial data)
-        conn.execute("INSERT INTO medium_blob_test (id, val_blob) VALUES (100, UTL_RAW.CAST_TO_RAW('x'))", &[])
-            .await
-            .expect("Failed to insert test data");
+        conn.execute(
+            "INSERT INTO medium_blob_test (id, val_blob) VALUES (100, UTL_RAW.CAST_TO_RAW('x'))",
+            &[],
+        )
+        .await
+        .expect("Failed to insert test data");
 
         // Query with FOR UPDATE to get writable locator
         let result = conn
-            .query("SELECT val_blob FROM medium_blob_test WHERE id = 100 FOR UPDATE", &[])
+            .query(
+                "SELECT val_blob FROM medium_blob_test WHERE id = 100 FOR UPDATE",
+                &[],
+            )
             .await
             .expect("Query failed");
 
@@ -688,17 +822,34 @@ mod data_type_tests {
 
                     // Get a fresh locator and verify the write
                     let fresh_result = conn
-                        .query("SELECT val_blob FROM medium_blob_test WHERE id = 100 FOR UPDATE", &[])
+                        .query(
+                            "SELECT val_blob FROM medium_blob_test WHERE id = 100 FOR UPDATE",
+                            &[],
+                        )
                         .await
                         .expect("Fresh query failed");
                     let fresh_row = &fresh_result.rows[0];
                     let fresh_lob = fresh_row.values().get(0).expect("Missing fresh LOB");
                     if let Value::Lob(fresh_lob_val) = fresh_lob {
-                        let fresh_locator = fresh_lob_val.as_locator().expect("Expected fresh LOB locator");
+                        let fresh_locator = fresh_lob_val
+                            .as_locator()
+                            .expect("Expected fresh LOB locator");
                         let content = conn.read_blob(fresh_locator).await.expect("Failed to read");
-                        eprintln!("[TEST] Read back {} bytes, expected >= {}", content.len(), size);
-                        assert!(content.len() >= size, "Expected at least {} bytes, got {}", size, content.len());
-                        assert!(content.iter().take(size).all(|&b| b == 0x42), "Content should be 0x42 bytes");
+                        eprintln!(
+                            "[TEST] Read back {} bytes, expected >= {}",
+                            content.len(),
+                            size
+                        );
+                        assert!(
+                            content.len() >= size,
+                            "Expected at least {} bytes, got {}",
+                            size,
+                            content.len()
+                        );
+                        assert!(
+                            content.iter().take(size).all(|&b| b == 0x42),
+                            "Content should be 0x42 bytes"
+                        );
                     } else {
                         panic!("Expected fresh LOB value");
                     }
@@ -754,9 +905,15 @@ mod data_type_tests {
                 let locator = lob.as_locator().expect("Expected LOB locator");
 
                 // Get original length
-                let original_length = conn.lob_length(locator).await.expect("Failed to get original length");
+                let original_length = conn
+                    .lob_length(locator)
+                    .await
+                    .expect("Failed to get original length");
                 eprintln!("[TEST] Original CLOB length: {}", original_length);
-                assert!(original_length > 5, "CLOB should be longer than 5 characters");
+                assert!(
+                    original_length > 5,
+                    "CLOB should be longer than 5 characters"
+                );
 
                 // Trim to 5 characters
                 conn.lob_trim(locator, 5).await.expect("Failed to trim LOB");
@@ -769,18 +926,30 @@ mod data_type_tests {
                 let fresh_row = &fresh_result.rows[0];
                 let fresh_lob = fresh_row.values().get(0).expect("Missing fresh CLOB");
                 if let Value::Lob(fresh_lob_val) = fresh_lob {
-                    let fresh_locator = fresh_lob_val.as_locator().expect("Expected fresh LOB locator");
+                    let fresh_locator = fresh_lob_val
+                        .as_locator()
+                        .expect("Expected fresh LOB locator");
 
                     // Read content after trim to verify
-                    let content = conn.read_clob(fresh_locator).await.expect("Failed to read trimmed CLOB");
+                    let content = conn
+                        .read_clob(fresh_locator)
+                        .await
+                        .expect("Failed to read trimmed CLOB");
                     eprintln!("[TEST] After trim CLOB content: {:?}", content);
 
                     // Check new length via lob_length
-                    let new_length = conn.lob_length(fresh_locator).await.expect("Failed to get new length");
+                    let new_length = conn
+                        .lob_length(fresh_locator)
+                        .await
+                        .expect("Failed to get new length");
                     eprintln!("[TEST] After trim lob_length: {}", new_length);
 
                     // Verify trimmed content
-                    assert_eq!(content.len(), 5, "Trimmed CLOB content should be 5 characters");
+                    assert_eq!(
+                        content.len(),
+                        5,
+                        "Trimmed CLOB content should be 5 characters"
+                    );
                     assert_eq!(new_length, 5, "Trimmed CLOB length should be 5");
                     assert_eq!(content, "Hello", "Trimmed content should be 'Hello'");
                 } else {
@@ -824,8 +993,11 @@ mod data_type_tests {
                 let content = conn.read_clob(locator).await.expect("Failed to read CLOB");
 
                 assert!(!content.is_empty(), "CLOB content should not be empty");
-                assert!(content.starts_with("This is a CLOB"),
-                    "CLOB content should start with 'This is a CLOB', got: {:?}", content);
+                assert!(
+                    content.starts_with("This is a CLOB"),
+                    "CLOB content should start with 'This is a CLOB', got: {:?}",
+                    content
+                );
             }
             _ => panic!("Expected LOB value, got {:?}", lob_value),
         }
@@ -860,10 +1032,13 @@ mod data_type_tests {
     async fn test_float_data_types() {
         let conn = connect().await.expect("Failed to connect");
 
-        let result = conn.query(
-            "SELECT val_float, val_double FROM test_data_types WHERE id = 1",
-            &[]
-        ).await.expect("Query failed");
+        let result = conn
+            .query(
+                "SELECT val_float, val_double FROM test_data_types WHERE id = 1",
+                &[],
+            )
+            .await
+            .expect("Query failed");
 
         assert_eq!(result.row_count(), 1);
 
@@ -875,10 +1050,10 @@ mod data_type_tests {
     async fn test_raw_data_type() {
         let conn = connect().await.expect("Failed to connect");
 
-        let result = conn.query(
-            "SELECT val_raw FROM test_data_types WHERE id = 1",
-            &[]
-        ).await.expect("Query failed");
+        let result = conn
+            .query("SELECT val_raw FROM test_data_types WHERE id = 1", &[])
+            .await
+            .expect("Query failed");
 
         assert_eq!(result.row_count(), 1);
 
@@ -897,8 +1072,10 @@ mod data_type_tests {
             .await.expect("Failed to drop table");
         conn.execute(
             "CREATE TABLE large_clob_test (id NUMBER, content CLOB)",
-            &[]
-        ).await.expect("Failed to create table");
+            &[],
+        )
+        .await
+        .expect("Failed to create table");
 
         // Insert a large CLOB (>8KB to span multiple packets)
         // Using TO_CLOB and concatenation to exceed VARCHAR2 limit (4000)
@@ -907,8 +1084,10 @@ mod data_type_tests {
              TO_CLOB(RPAD('X', 4000, 'X')) ||
              TO_CLOB(RPAD('X', 4000, 'X')) ||
              TO_CLOB(RPAD('X', 2000, 'X')))",
-            &[]
-        ).await.expect("Failed to insert large CLOB");
+            &[],
+        )
+        .await
+        .expect("Failed to insert large CLOB");
 
         // Query the CLOB
         let result = conn
@@ -927,16 +1106,31 @@ mod data_type_tests {
                 let size = lob.size().unwrap_or(0);
 
                 // Size should be 10000 characters (4000 + 4000 + 2000)
-                assert!(size >= 10000, "CLOB should be at least 10000 bytes, got {}", size);
+                assert!(
+                    size >= 10000,
+                    "CLOB should be at least 10000 bytes, got {}",
+                    size
+                );
 
                 // Read the entire CLOB - this tests multi-packet handling
-                let content = conn.read_clob(locator).await.expect("Failed to read large CLOB");
+                let content = conn
+                    .read_clob(locator)
+                    .await
+                    .expect("Failed to read large CLOB");
 
                 // Verify size matches
-                assert_eq!(content.len(), 10000, "Content should be 10000 characters, got {}", content.len());
+                assert_eq!(
+                    content.len(),
+                    10000,
+                    "Content should be 10000 characters, got {}",
+                    content.len()
+                );
 
                 // Verify content is all X's
-                assert!(content.chars().all(|c| c == 'X'), "Content should be all X's");
+                assert!(
+                    content.chars().all(|c| c == 'X'),
+                    "Content should be all X's"
+                );
             }
             _ => panic!("Expected LOB value, got {:?}", lob_value),
         }
@@ -963,8 +1157,10 @@ mod data_type_tests {
             .await.expect("Failed to drop table");
         conn.execute(
             "CREATE TABLE stream_clob_test (id NUMBER, content CLOB)",
-            &[]
-        ).await.expect("Failed to create table");
+            &[],
+        )
+        .await
+        .expect("Failed to create table");
 
         // Insert a large CLOB (>8KB)
         conn.execute(
@@ -972,8 +1168,10 @@ mod data_type_tests {
              TO_CLOB(RPAD('A', 4000, 'A')) ||
              TO_CLOB(RPAD('B', 4000, 'B')) ||
              TO_CLOB(RPAD('C', 4000, 'C')))",
-            &[]
-        ).await.expect("Failed to insert CLOB");
+            &[],
+        )
+        .await
+        .expect("Failed to insert CLOB");
 
         // Query the CLOB
         let result = conn
@@ -994,7 +1192,10 @@ mod data_type_tests {
                 assert_eq!(total_size, 12000, "CLOB should be 12000 bytes");
 
                 // Test lob_chunk_size
-                let chunk_size = conn.lob_chunk_size(locator).await.expect("Failed to get chunk size");
+                let chunk_size = conn
+                    .lob_chunk_size(locator)
+                    .await
+                    .expect("Failed to get chunk size");
                 eprintln!("[TEST] LOB chunk size: {}", chunk_size);
                 assert!(chunk_size > 0, "Chunk size should be > 0");
 
@@ -1020,16 +1221,29 @@ mod data_type_tests {
                         }
                         Ok(())
                     }
-                }).await.expect("Failed to stream LOB");
+                })
+                .await
+                .expect("Failed to stream LOB");
 
                 let chunks_read = chunk_count.load(Ordering::SeqCst);
                 let bytes_read = total_bytes.load(Ordering::SeqCst);
 
-                eprintln!("[TEST] Chunks read: {}, Bytes read: {}", chunks_read, bytes_read);
+                eprintln!(
+                    "[TEST] Chunks read: {}, Bytes read: {}",
+                    chunks_read, bytes_read
+                );
 
                 // Should have read ~6 chunks (12000 / 2000)
-                assert!(chunks_read >= 6, "Should have read at least 6 chunks, got {}", chunks_read);
-                assert_eq!(bytes_read, 12000, "Should have read 12000 bytes total, got {}", bytes_read);
+                assert!(
+                    chunks_read >= 6,
+                    "Should have read at least 6 chunks, got {}",
+                    chunks_read
+                );
+                assert_eq!(
+                    bytes_read, 12000,
+                    "Should have read 12000 bytes total, got {}",
+                    bytes_read
+                );
             }
             _ => panic!("Expected LOB value, got {:?}", lob_value),
         }
@@ -1053,11 +1267,17 @@ mod dml_tests {
 
         // Insert a row
         eprintln!("[TEST] Starting INSERT");
-        let result = conn.execute(
-            "INSERT INTO test_departments (dept_id, dept_name) VALUES (100, 'Test Department')",
-            &[]
-        ).await.expect("Insert failed");
-        eprintln!("[TEST] INSERT completed, rows_affected={}", result.rows_affected);
+        let result = conn
+            .execute(
+                "INSERT INTO test_departments (dept_id, dept_name) VALUES (100, 'Test Department')",
+                &[],
+            )
+            .await
+            .expect("Insert failed");
+        eprintln!(
+            "[TEST] INSERT completed, rows_affected={}",
+            result.rows_affected
+        );
 
         // Should affect 1 row
         assert_eq!(result.rows_affected, 1);
@@ -1069,10 +1289,10 @@ mod dml_tests {
 
         // Verify it was rolled back
         eprintln!("[TEST] Starting SELECT query");
-        let result = conn.query(
-            "SELECT * FROM test_departments WHERE dept_id = 100",
-            &[]
-        ).await.expect("Query failed");
+        let result = conn
+            .query("SELECT * FROM test_departments WHERE dept_id = 100", &[])
+            .await
+            .expect("Query failed");
         eprintln!("[TEST] SELECT completed");
 
         assert!(result.is_empty());
@@ -1086,10 +1306,13 @@ mod dml_tests {
         let conn = connect().await.expect("Failed to connect");
 
         // Update rows
-        let result = conn.execute(
-            "UPDATE test_employees SET salary = salary + 1 WHERE dept_id = 1",
-            &[]
-        ).await.expect("Update failed");
+        let result = conn
+            .execute(
+                "UPDATE test_employees SET salary = salary + 1 WHERE dept_id = 1",
+                &[],
+            )
+            .await
+            .expect("Update failed");
 
         // Should affect some rows (Engineering department)
         assert!(result.rows_affected > 0);
@@ -1106,10 +1329,10 @@ mod dml_tests {
         let conn = connect().await.expect("Failed to connect");
 
         // Delete a row
-        let result = conn.execute(
-            "DELETE FROM test_employees WHERE emp_id = 5",
-            &[]
-        ).await.expect("Delete failed");
+        let result = conn
+            .execute("DELETE FROM test_employees WHERE emp_id = 5", &[])
+            .await
+            .expect("Delete failed");
 
         // Should affect 1 row
         assert_eq!(result.rows_affected, 1);
@@ -1118,10 +1341,10 @@ mod dml_tests {
         conn.rollback().await.expect("Rollback failed");
 
         // Verify row is still there
-        let result = conn.query(
-            "SELECT * FROM test_employees WHERE emp_id = 5",
-            &[]
-        ).await.expect("Query failed");
+        let result = conn
+            .query("SELECT * FROM test_employees WHERE emp_id = 5", &[])
+            .await
+            .expect("Query failed");
 
         assert_eq!(result.row_count(), 1);
 
@@ -1134,10 +1357,13 @@ mod dml_tests {
         let conn = connect().await.expect("Failed to connect");
 
         // Insert with a high ID that won't conflict
-        let result = conn.execute(
-            "INSERT INTO test_departments (dept_id, dept_name) VALUES (999, 'Temp Dept')",
-            &[]
-        ).await.expect("Insert failed");
+        let result = conn
+            .execute(
+                "INSERT INTO test_departments (dept_id, dept_name) VALUES (999, 'Temp Dept')",
+                &[],
+            )
+            .await
+            .expect("Insert failed");
 
         // Should affect 1 row
         assert_eq!(result.rows_affected, 1);
@@ -1146,15 +1372,17 @@ mod dml_tests {
         conn.commit().await.expect("Commit failed");
 
         // Verify it's there
-        let result = conn.query(
-            "SELECT * FROM test_departments WHERE dept_id = 999",
-            &[]
-        ).await.expect("Query failed");
+        let result = conn
+            .query("SELECT * FROM test_departments WHERE dept_id = 999", &[])
+            .await
+            .expect("Query failed");
 
         assert_eq!(result.row_count(), 1);
 
         // Clean up
-        conn.execute("DELETE FROM test_departments WHERE dept_id = 999", &[]).await.ok();
+        conn.execute("DELETE FROM test_departments WHERE dept_id = 999", &[])
+            .await
+            .ok();
         conn.commit().await.expect("Commit failed");
 
         conn.close().await.expect("Failed to close");
@@ -1171,16 +1399,19 @@ mod transaction_tests {
         let conn2 = connect().await.expect("Failed to connect conn2");
 
         // Insert on conn1 but don't commit
-        conn1.execute(
-            "INSERT INTO test_departments (dept_id, dept_name) VALUES (888, 'Isolated Dept')",
-            &[]
-        ).await.expect("Insert failed");
+        conn1
+            .execute(
+                "INSERT INTO test_departments (dept_id, dept_name) VALUES (888, 'Isolated Dept')",
+                &[],
+            )
+            .await
+            .expect("Insert failed");
 
         // Query from conn2 - should not see uncommitted row
-        let result = conn2.query(
-            "SELECT * FROM test_departments WHERE dept_id = 888",
-            &[]
-        ).await.expect("Query failed");
+        let result = conn2
+            .query("SELECT * FROM test_departments WHERE dept_id = 888", &[])
+            .await
+            .expect("Query failed");
 
         // Should be empty (uncommitted data not visible)
         assert!(result.is_empty());
@@ -1206,42 +1437,70 @@ mod transaction_tests {
         conn.execute("DELETE FROM savepoint_test", &[]).await.ok();
 
         // Insert first row
-        conn.execute("INSERT INTO savepoint_test (id, val) VALUES (1, 'first')", &[])
-            .await.expect("Insert 1 failed");
+        conn.execute(
+            "INSERT INTO savepoint_test (id, val) VALUES (1, 'first')",
+            &[],
+        )
+        .await
+        .expect("Insert 1 failed");
 
         // Create savepoint
-        conn.savepoint("sp1").await.expect("Failed to create savepoint");
+        conn.savepoint("sp1")
+            .await
+            .expect("Failed to create savepoint");
 
         // Insert second row
-        conn.execute("INSERT INTO savepoint_test (id, val) VALUES (2, 'second')", &[])
-            .await.expect("Insert 2 failed");
+        conn.execute(
+            "INSERT INTO savepoint_test (id, val) VALUES (2, 'second')",
+            &[],
+        )
+        .await
+        .expect("Insert 2 failed");
 
         // Create another savepoint
-        conn.savepoint("sp2").await.expect("Failed to create savepoint sp2");
+        conn.savepoint("sp2")
+            .await
+            .expect("Failed to create savepoint sp2");
 
         // Insert third row
-        conn.execute("INSERT INTO savepoint_test (id, val) VALUES (3, 'third')", &[])
-            .await.expect("Insert 3 failed");
+        conn.execute(
+            "INSERT INTO savepoint_test (id, val) VALUES (3, 'third')",
+            &[],
+        )
+        .await
+        .expect("Insert 3 failed");
 
         // Verify all 3 rows exist
-        let result = conn.query("SELECT COUNT(*) FROM savepoint_test", &[])
-            .await.expect("Count query failed");
+        let result = conn
+            .query("SELECT COUNT(*) FROM savepoint_test", &[])
+            .await
+            .expect("Count query failed");
         println!("Before rollback: {:?}", result.rows[0].values());
 
         // Rollback to sp1 - should remove rows 2 and 3
-        conn.rollback_to_savepoint("sp1").await.expect("Rollback to savepoint failed");
+        conn.rollback_to_savepoint("sp1")
+            .await
+            .expect("Rollback to savepoint failed");
 
         // Verify only row 1 exists
-        let result = conn.query("SELECT id FROM savepoint_test ORDER BY id", &[])
-            .await.expect("Query failed");
-        assert_eq!(result.row_count(), 1, "Should have 1 row after rollback to sp1");
+        let result = conn
+            .query("SELECT id FROM savepoint_test ORDER BY id", &[])
+            .await
+            .expect("Query failed");
+        assert_eq!(
+            result.row_count(),
+            1,
+            "Should have 1 row after rollback to sp1"
+        );
 
         // Commit - row 1 should be persisted
         conn.commit().await.expect("Commit failed");
 
         // Verify row 1 is still there
-        let result = conn.query("SELECT id FROM savepoint_test", &[])
-            .await.expect("Final query failed");
+        let result = conn
+            .query("SELECT id FROM savepoint_test", &[])
+            .await
+            .expect("Final query failed");
         assert_eq!(result.row_count(), 1);
 
         // Clean up
@@ -1287,10 +1546,12 @@ mod error_handling_tests {
         let conn = connect().await.expect("Failed to connect");
 
         // Try to insert duplicate primary key
-        let result = conn.execute(
-            "INSERT INTO test_departments (dept_id, dept_name) VALUES (1, 'Duplicate')",
-            &[]
-        ).await;
+        let result = conn
+            .execute(
+                "INSERT INTO test_departments (dept_id, dept_name) VALUES (1, 'Duplicate')",
+                &[],
+            )
+            .await;
 
         assert!(result.is_err());
 
@@ -1328,10 +1589,10 @@ mod aggregate_tests {
     async fn test_count_query() {
         let conn = connect().await.expect("Failed to connect");
 
-        let result = conn.query(
-            "SELECT COUNT(*) AS cnt FROM test_employees",
-            &[]
-        ).await.expect("Query failed");
+        let result = conn
+            .query("SELECT COUNT(*) AS cnt FROM test_employees", &[])
+            .await
+            .expect("Query failed");
 
         assert_eq!(result.row_count(), 1);
         assert!(result.column_by_name("CNT").is_some());
@@ -1344,10 +1605,13 @@ mod aggregate_tests {
     async fn test_sum_query() {
         let conn = connect().await.expect("Failed to connect");
 
-        let result = conn.query(
-            "SELECT SUM(salary) AS total_salary FROM test_employees",
-            &[]
-        ).await.expect("Query failed");
+        let result = conn
+            .query(
+                "SELECT SUM(salary) AS total_salary FROM test_employees",
+                &[],
+            )
+            .await
+            .expect("Query failed");
 
         assert_eq!(result.row_count(), 1);
 
@@ -1379,13 +1643,16 @@ mod join_tests {
     async fn test_inner_join() {
         let conn = connect().await.expect("Failed to connect");
 
-        let result = conn.query(
-            "SELECT e.first_name, e.last_name, d.dept_name
+        let result = conn
+            .query(
+                "SELECT e.first_name, e.last_name, d.dept_name
              FROM test_employees e
              JOIN test_departments d ON e.dept_id = d.dept_id
              ORDER BY e.emp_id",
-            &[]
-        ).await.expect("Query failed");
+                &[],
+            )
+            .await
+            .expect("Query failed");
 
         assert_eq!(result.row_count(), 6);
         assert_eq!(result.column_count(), 3);
@@ -1398,13 +1665,16 @@ mod join_tests {
     async fn test_left_join() {
         let conn = connect().await.expect("Failed to connect");
 
-        let result = conn.query(
-            "SELECT d.dept_name, COUNT(e.emp_id) AS emp_count
+        let result = conn
+            .query(
+                "SELECT d.dept_name, COUNT(e.emp_id) AS emp_count
              FROM test_departments d
              LEFT JOIN test_employees e ON d.dept_id = e.dept_id
              GROUP BY d.dept_name",
-            &[]
-        ).await.expect("Query failed");
+                &[],
+            )
+            .await
+            .expect("Query failed");
 
         assert!(result.row_count() >= 1);
 
@@ -1420,11 +1690,14 @@ mod subquery_tests {
     async fn test_subquery_in_where() {
         let conn = connect().await.expect("Failed to connect");
 
-        let result = conn.query(
-            "SELECT * FROM test_employees
+        let result = conn
+            .query(
+                "SELECT * FROM test_employees
              WHERE salary > (SELECT AVG(salary) FROM test_employees)",
-            &[]
-        ).await.expect("Query failed");
+                &[],
+            )
+            .await
+            .expect("Query failed");
 
         // Some employees should have above-average salary
         assert!(result.row_count() > 0);
@@ -1437,13 +1710,16 @@ mod subquery_tests {
     async fn test_subquery_in_select() {
         let conn = connect().await.expect("Failed to connect");
 
-        let result = conn.query(
-            "SELECT first_name,
+        let result = conn
+            .query(
+                "SELECT first_name,
                     (SELECT dept_name FROM test_departments WHERE dept_id = e.dept_id) AS dept
              FROM test_employees e
              WHERE emp_id = 1",
-            &[]
-        ).await.expect("Query failed");
+                &[],
+            )
+            .await
+            .expect("Query failed");
 
         assert_eq!(result.row_count(), 1);
 
@@ -1462,12 +1738,19 @@ mod bind_parameter_tests {
         let conn = connect().await.expect("Failed to connect");
 
         // Query with an integer bind parameter using ergonomic .into() syntax
-        let result = conn.query(
-            "SELECT emp_id, first_name FROM test_employees WHERE emp_id = :1",
-            &[1i64.into()]
-        ).await.expect("Query with integer bind failed");
+        let result = conn
+            .query(
+                "SELECT emp_id, first_name FROM test_employees WHERE emp_id = :1",
+                &[1i64.into()],
+            )
+            .await
+            .expect("Query with integer bind failed");
 
-        assert_eq!(result.row_count(), 1, "Should find exactly one employee with ID 1");
+        assert_eq!(
+            result.row_count(),
+            1,
+            "Should find exactly one employee with ID 1"
+        );
 
         let row = &result.rows[0];
         // Note: Numbers may come back as Integer or String depending on column metadata
@@ -1487,12 +1770,18 @@ mod bind_parameter_tests {
         let conn = connect().await.expect("Failed to connect");
 
         // Query with a string bind parameter using ergonomic .into() syntax
-        let result = conn.query(
-            "SELECT emp_id, first_name FROM test_employees WHERE first_name = :1",
-            &["John".into()]
-        ).await.expect("Query with string bind failed");
+        let result = conn
+            .query(
+                "SELECT emp_id, first_name FROM test_employees WHERE first_name = :1",
+                &["John".into()],
+            )
+            .await
+            .expect("Query with string bind failed");
 
-        assert!(result.row_count() >= 1, "Should find at least one employee named John");
+        assert!(
+            result.row_count() >= 1,
+            "Should find at least one employee named John"
+        );
 
         conn.close().await.expect("Failed to close");
     }
@@ -1533,21 +1822,29 @@ mod bind_parameter_tests {
         ).await.expect("Failed to create bind_test table");
 
         // Clean up any existing test data
-        conn.execute("DELETE FROM bind_test WHERE id >= 1000", &[]).await.ok();
+        conn.execute("DELETE FROM bind_test WHERE id >= 1000", &[])
+            .await
+            .ok();
 
         // Insert with bind parameters using ergonomic .into() syntax
-        let insert_result = conn.execute(
-            "INSERT INTO bind_test (id, name, value) VALUES (:1, :2, :3)",
-            &[1001i64.into(), "Test Name".into(), 42i64.into()]
-        ).await.expect("Insert with binds failed");
+        let insert_result = conn
+            .execute(
+                "INSERT INTO bind_test (id, name, value) VALUES (:1, :2, :3)",
+                &[1001i64.into(), "Test Name".into(), 42i64.into()],
+            )
+            .await
+            .expect("Insert with binds failed");
 
         assert_eq!(insert_result.rows_affected, 1, "Should insert 1 row");
 
         // Select with bind parameter to verify
-        let select_result = conn.query(
-            "SELECT id, name, value FROM bind_test WHERE id = :1",
-            &[Value::Integer(1001)]
-        ).await.expect("Select with bind failed");
+        let select_result = conn
+            .query(
+                "SELECT id, name, value FROM bind_test WHERE id = :1",
+                &[Value::Integer(1001)],
+            )
+            .await
+            .expect("Select with bind failed");
 
         assert_eq!(select_result.row_count(), 1, "Should find inserted row");
 
@@ -1584,20 +1881,27 @@ mod bind_parameter_tests {
         ).await.expect("Failed to create table");
 
         // Clean up
-        conn.execute("DELETE FROM bind_null_test WHERE id >= 1000", &[]).await.ok();
+        conn.execute("DELETE FROM bind_null_test WHERE id >= 1000", &[])
+            .await
+            .ok();
 
         // Insert with NULL bind parameter using Option<T>::None.into()
         let name: Option<String> = None;
         conn.execute(
             "INSERT INTO bind_null_test (id, name) VALUES (:1, :2)",
-            &[1002i64.into(), name.into()]
-        ).await.expect("Insert with NULL bind failed");
+            &[1002i64.into(), name.into()],
+        )
+        .await
+        .expect("Insert with NULL bind failed");
 
         // Verify the NULL was inserted
-        let result = conn.query(
-            "SELECT id, name FROM bind_null_test WHERE id = :1",
-            &[Value::Integer(1002)]
-        ).await.expect("Select failed");
+        let result = conn
+            .query(
+                "SELECT id, name FROM bind_null_test WHERE id = :1",
+                &[Value::Integer(1002)],
+            )
+            .await
+            .expect("Select failed");
 
         assert_eq!(result.row_count(), 1);
         let row = &result.rows[0];
@@ -1617,22 +1921,31 @@ mod bind_parameter_tests {
             .await.expect("Failed to drop table");
         conn.execute(
             "CREATE TABLE bind_float_test (id NUMBER, price NUMBER(10,2))",
-            &[]
-        ).await.expect("Failed to create table");
+            &[],
+        )
+        .await
+        .expect("Failed to create table");
 
-        conn.execute("DELETE FROM bind_float_test WHERE id >= 1000", &[]).await.ok();
+        conn.execute("DELETE FROM bind_float_test WHERE id >= 1000", &[])
+            .await
+            .ok();
 
         // Insert with float bind using ergonomic .into() syntax
         conn.execute(
             "INSERT INTO bind_float_test (id, price) VALUES (:1, :2)",
-            &[1003i64.into(), 99.99f64.into()]
-        ).await.expect("Insert with float failed");
+            &[1003i64.into(), 99.99f64.into()],
+        )
+        .await
+        .expect("Insert with float failed");
 
         // Verify
-        let result = conn.query(
-            "SELECT id, price FROM bind_float_test WHERE id = :1",
-            &[Value::Integer(1003)]
-        ).await.expect("Select failed");
+        let result = conn
+            .query(
+                "SELECT id, price FROM bind_float_test WHERE id = :1",
+                &[Value::Integer(1003)],
+            )
+            .await
+            .expect("Select failed");
 
         assert_eq!(result.row_count(), 1);
         let row = &result.rows[0];
@@ -1643,7 +1956,11 @@ mod bind_parameter_tests {
             Value::Integer(i) => *i as f64,
             v => panic!("Unexpected price type: {:?}", v),
         };
-        assert!((price - 99.99).abs() < 0.01, "Price should be approximately 99.99, got {}", price);
+        assert!(
+            (price - 99.99).abs() < 0.01,
+            "Price should be approximately 99.99, got {}",
+            price
+        );
 
         conn.rollback().await.expect("Failed to rollback");
         conn.close().await.expect("Failed to close");
@@ -1666,7 +1983,9 @@ mod batch_execution_tests {
         ).await.expect("Failed to create table");
 
         // Clean up any existing test data
-        conn.execute("DELETE FROM batch_test WHERE id >= 2000", &[]).await.ok();
+        conn.execute("DELETE FROM batch_test WHERE id >= 2000", &[])
+            .await
+            .ok();
 
         // Build batch insert
         let batch = BatchBuilder::new("INSERT INTO batch_test (id, name) VALUES (:1, :2)")
@@ -1676,17 +1995,23 @@ mod batch_execution_tests {
             .build();
 
         // Execute batch
-        let result = conn.execute_batch(&batch).await.expect("Batch insert failed");
+        let result = conn
+            .execute_batch(&batch)
+            .await
+            .expect("Batch insert failed");
 
         assert_eq!(result.success_count, 3, "Should have 3 successful inserts");
         assert_eq!(result.total_rows_affected, 3, "Should affect 3 rows");
         assert!(result.is_success(), "Batch should succeed without errors");
 
         // Verify inserted data
-        let query_result = conn.query(
-            "SELECT id, name FROM batch_test WHERE id >= 2001 AND id <= 2003 ORDER BY id",
-            &[]
-        ).await.expect("Select failed");
+        let query_result = conn
+            .query(
+                "SELECT id, name FROM batch_test WHERE id >= 2001 AND id <= 2003 ORDER BY id",
+                &[],
+            )
+            .await
+            .expect("Select failed");
 
         assert_eq!(query_result.row_count(), 3, "Should find 3 rows");
         assert_eq!(query_result.rows[0].get_string(1), Some("Alice"));
@@ -1709,32 +2034,51 @@ mod batch_execution_tests {
         ).await.expect("Failed to create table");
 
         // Clean and insert test data
-        conn.execute("DELETE FROM batch_update_test", &[]).await.ok();
-        conn.execute("INSERT INTO batch_update_test VALUES (1, 10)", &[]).await.ok();
-        conn.execute("INSERT INTO batch_update_test VALUES (2, 20)", &[]).await.ok();
-        conn.execute("INSERT INTO batch_update_test VALUES (3, 30)", &[]).await.ok();
+        conn.execute("DELETE FROM batch_update_test", &[])
+            .await
+            .ok();
+        conn.execute("INSERT INTO batch_update_test VALUES (1, 10)", &[])
+            .await
+            .ok();
+        conn.execute("INSERT INTO batch_update_test VALUES (2, 20)", &[])
+            .await
+            .ok();
+        conn.execute("INSERT INTO batch_update_test VALUES (3, 30)", &[])
+            .await
+            .ok();
         conn.commit().await.expect("Failed to commit setup");
 
         // Build batch update with row counts enabled
-        let batch = BatchBuilder::new("UPDATE batch_update_test SET value = value + 1 WHERE id = :1")
-            .add_row(vec![1i64.into()])
-            .add_row(vec![2i64.into()])
-            .add_row(vec![3i64.into()])
-            .with_row_counts()
-            .build();
+        let batch =
+            BatchBuilder::new("UPDATE batch_update_test SET value = value + 1 WHERE id = :1")
+                .add_row(vec![1i64.into()])
+                .add_row(vec![2i64.into()])
+                .add_row(vec![3i64.into()])
+                .with_row_counts()
+                .build();
 
-        let result = conn.execute_batch(&batch).await.expect("Batch update failed");
+        let result = conn
+            .execute_batch(&batch)
+            .await
+            .expect("Batch update failed");
 
         assert_eq!(result.success_count, 3);
         assert_eq!(result.total_rows_affected, 3);
 
-        // Verify row counts are returned
-        assert!(result.row_counts.is_some(), "Row counts should be returned");
-        let counts = result.row_counts.unwrap();
-        assert_eq!(counts.len(), 3);
-        assert_eq!(counts[0], 1);
-        assert_eq!(counts[1], 1);
-        assert_eq!(counts[2], 1);
+        if supports_array_dml_row_counts(&conn).await {
+            // Verify row counts are returned
+            assert!(result.row_counts.is_some(), "Row counts should be returned");
+            let counts = result.row_counts.unwrap();
+            assert_eq!(counts.len(), 3);
+            assert_eq!(counts[0], 1);
+            assert_eq!(counts[1], 1);
+            assert_eq!(counts[2], 1);
+        } else {
+            assert!(
+                result.row_counts.is_none(),
+                "Oracle 11g does not return array DML row counts"
+            );
+        }
 
         conn.rollback().await.expect("Failed to rollback");
         conn.close().await.expect("Failed to close");
@@ -1751,24 +2095,44 @@ mod batch_execution_tests {
             &[]
         ).await.expect("Failed to create table");
 
-        conn.execute("DELETE FROM batch_mixed_test WHERE id >= 3000", &[]).await.ok();
+        conn.execute("DELETE FROM batch_mixed_test WHERE id >= 3000", &[])
+            .await
+            .ok();
 
         // Build batch with mixed types
-        let batch = BatchBuilder::new("INSERT INTO batch_mixed_test (id, name, price, active) VALUES (:1, :2, :3, :4)")
-            .add_row(vec![3001i64.into(), "Product A".into(), 19.99f64.into(), 1i64.into()])
-            .add_row(vec![3002i64.into(), "Product B".into(), 29.99f64.into(), 0i64.into()])
-            .build();
+        let batch = BatchBuilder::new(
+            "INSERT INTO batch_mixed_test (id, name, price, active) VALUES (:1, :2, :3, :4)",
+        )
+        .add_row(vec![
+            3001i64.into(),
+            "Product A".into(),
+            19.99f64.into(),
+            1i64.into(),
+        ])
+        .add_row(vec![
+            3002i64.into(),
+            "Product B".into(),
+            29.99f64.into(),
+            0i64.into(),
+        ])
+        .build();
 
-        let result = conn.execute_batch(&batch).await.expect("Batch insert failed");
+        let result = conn
+            .execute_batch(&batch)
+            .await
+            .expect("Batch insert failed");
 
         assert_eq!(result.success_count, 2);
         assert!(result.is_success());
 
         // Verify
-        let query_result = conn.query(
-            "SELECT id, name, price FROM batch_mixed_test WHERE id >= 3001 ORDER BY id",
-            &[]
-        ).await.expect("Select failed");
+        let query_result = conn
+            .query(
+                "SELECT id, name, price FROM batch_mixed_test WHERE id >= 3001 ORDER BY id",
+                &[],
+            )
+            .await
+            .expect("Select failed");
 
         assert_eq!(query_result.row_count(), 2);
 
@@ -1787,30 +2151,42 @@ mod batch_execution_tests {
             &[]
         ).await.expect("Failed to create table");
 
-        conn.execute("DELETE FROM batch_null_test WHERE id >= 4000", &[]).await.ok();
+        conn.execute("DELETE FROM batch_null_test WHERE id >= 4000", &[])
+            .await
+            .ok();
 
         // Build batch with NULL values
         let name_some: Option<String> = Some("Has Value".to_string());
         let name_none: Option<String> = None;
 
-        let batch = BatchBuilder::new("INSERT INTO batch_null_test (id, optional_value) VALUES (:1, :2)")
-            .add_row(vec![4001i64.into(), name_some.into()])
-            .add_row(vec![4002i64.into(), name_none.into()])
-            .build();
+        let batch =
+            BatchBuilder::new("INSERT INTO batch_null_test (id, optional_value) VALUES (:1, :2)")
+                .add_row(vec![4001i64.into(), name_some.into()])
+                .add_row(vec![4002i64.into(), name_none.into()])
+                .build();
 
-        let result = conn.execute_batch(&batch).await.expect("Batch insert failed");
+        let result = conn
+            .execute_batch(&batch)
+            .await
+            .expect("Batch insert failed");
 
         assert_eq!(result.success_count, 2);
 
         // Verify NULL handling
-        let query_result = conn.query(
-            "SELECT id, optional_value FROM batch_null_test WHERE id >= 4001 ORDER BY id",
-            &[]
-        ).await.expect("Select failed");
+        let query_result = conn
+            .query(
+                "SELECT id, optional_value FROM batch_null_test WHERE id >= 4001 ORDER BY id",
+                &[],
+            )
+            .await
+            .expect("Select failed");
 
         assert_eq!(query_result.row_count(), 2);
         assert_eq!(query_result.rows[0].get_string(1), Some("Has Value"));
-        assert!(query_result.rows[1].is_null(1), "Second row should have NULL");
+        assert!(
+            query_result.rows[1].is_null(1),
+            "Second row should have NULL"
+        );
 
         conn.rollback().await.expect("Failed to rollback");
         conn.close().await.expect("Failed to close");
@@ -1827,12 +2203,24 @@ mod batch_execution_tests {
             &[]
         ).await.expect("Failed to create table");
 
-        conn.execute("DELETE FROM batch_delete_test", &[]).await.ok();
-        conn.execute("INSERT INTO batch_delete_test VALUES (1, 'A')", &[]).await.ok();
-        conn.execute("INSERT INTO batch_delete_test VALUES (2, 'A')", &[]).await.ok();
-        conn.execute("INSERT INTO batch_delete_test VALUES (3, 'B')", &[]).await.ok();
-        conn.execute("INSERT INTO batch_delete_test VALUES (4, 'B')", &[]).await.ok();
-        conn.execute("INSERT INTO batch_delete_test VALUES (5, 'C')", &[]).await.ok();
+        conn.execute("DELETE FROM batch_delete_test", &[])
+            .await
+            .ok();
+        conn.execute("INSERT INTO batch_delete_test VALUES (1, 'A')", &[])
+            .await
+            .ok();
+        conn.execute("INSERT INTO batch_delete_test VALUES (2, 'A')", &[])
+            .await
+            .ok();
+        conn.execute("INSERT INTO batch_delete_test VALUES (3, 'B')", &[])
+            .await
+            .ok();
+        conn.execute("INSERT INTO batch_delete_test VALUES (4, 'B')", &[])
+            .await
+            .ok();
+        conn.execute("INSERT INTO batch_delete_test VALUES (5, 'C')", &[])
+            .await
+            .ok();
         conn.commit().await.expect("Failed to commit setup");
 
         // Batch delete by category
@@ -1842,22 +2230,54 @@ mod batch_execution_tests {
             .with_row_counts()
             .build();
 
-        let result = conn.execute_batch(&batch).await.expect("Batch delete failed");
+        let result = conn
+            .execute_batch(&batch)
+            .await
+            .expect("Batch delete failed");
 
         assert_eq!(result.success_count, 2);
-        assert_eq!(result.total_rows_affected, 4, "Should delete 4 rows total (2 A's + 2 B's)");
+        assert_eq!(
+            result.total_rows_affected, 4,
+            "Should delete 4 rows total (2 A's + 2 B's)"
+        );
 
-        // Per-row counts should show 2 rows deleted for each category
-        let counts = result.row_counts.expect("Row counts should be returned");
-        assert_eq!(counts.len(), 2, "Should have row counts for both executions");
-        assert_eq!(counts[0], 2, "First delete (category A) should delete 2 rows");
-        assert_eq!(counts[1], 2, "Second delete (category B) should delete 2 rows");
+        if supports_array_dml_row_counts(&conn).await {
+            // Per-row counts should show 2 rows deleted for each category
+            let counts = result.row_counts.expect("Row counts should be returned");
+            assert_eq!(
+                counts.len(),
+                2,
+                "Should have row counts for both executions"
+            );
+            assert_eq!(
+                counts[0], 2,
+                "First delete (category A) should delete 2 rows"
+            );
+            assert_eq!(
+                counts[1], 2,
+                "Second delete (category B) should delete 2 rows"
+            );
+        } else {
+            assert!(
+                result.row_counts.is_none(),
+                "Oracle 11g does not return array DML row counts"
+            );
+        }
 
         // Verify only category C remains
-        let query_result = conn.query("SELECT id, category FROM batch_delete_test ORDER BY id", &[])
-            .await.expect("Select failed");
+        let query_result = conn
+            .query(
+                "SELECT id, category FROM batch_delete_test ORDER BY id",
+                &[],
+            )
+            .await
+            .expect("Select failed");
 
-        assert_eq!(query_result.row_count(), 1, "Should have 1 row remaining (category C)");
+        assert_eq!(
+            query_result.row_count(),
+            1,
+            "Should have 1 row remaining (category C)"
+        );
         assert_eq!(query_result.rows[0].get_string(1), Some("C"));
 
         conn.rollback().await.expect("Failed to rollback");
@@ -1875,16 +2295,22 @@ mod batch_execution_tests {
             &[]
         ).await.expect("Failed to create table");
 
-        conn.execute("DELETE FROM batch_large_test WHERE id >= 10000", &[]).await.ok();
+        conn.execute("DELETE FROM batch_large_test WHERE id >= 10000", &[])
+            .await
+            .ok();
 
         // Build a larger batch (100 rows)
-        let mut builder = BatchBuilder::new("INSERT INTO batch_large_test (id, data) VALUES (:1, :2)");
+        let mut builder =
+            BatchBuilder::new("INSERT INTO batch_large_test (id, data) VALUES (:1, :2)");
         for i in 0..100 {
             builder = builder.add_row(vec![(10000 + i as i64).into(), format!("Row {}", i).into()]);
         }
         let batch = builder.build();
 
-        let result = conn.execute_batch(&batch).await.expect("Large batch insert failed");
+        let result = conn
+            .execute_batch(&batch)
+            .await
+            .expect("Large batch insert failed");
 
         assert_eq!(result.success_count, 100);
         assert_eq!(result.total_rows_affected, 100);
@@ -1896,7 +2322,11 @@ mod batch_execution_tests {
             &[]
         ).await.expect("Select failed");
 
-        assert_eq!(query_result.row_count(), 10, "Should have at least first 10 rows");
+        assert_eq!(
+            query_result.row_count(),
+            10,
+            "Should have at least first 10 rows"
+        );
         assert_eq!(query_result.rows[0].get_string(1), Some("Row 0"));
         assert_eq!(query_result.rows[9].get_string(1), Some("Row 9"));
 
@@ -1915,22 +2345,31 @@ mod scrollable_cursor_tests {
         let conn = connect().await.expect("Failed to connect");
 
         // Open a scrollable cursor using DUAL for simple testing
-        let mut cursor = conn.open_scrollable_cursor(
-            "SELECT 1 AS col1, 'test' AS col2 FROM dual"
-        ).await.expect("Failed to open scrollable cursor");
+        let mut cursor = conn
+            .open_scrollable_cursor("SELECT 1 AS col1, 'test' AS col2 FROM dual")
+            .await
+            .expect("Failed to open scrollable cursor");
 
         assert!(cursor.is_open());
-        assert!(cursor.columns().len() >= 2, "Expected at least 2 columns, got {}", cursor.columns().len());
+        assert!(
+            cursor.columns().len() >= 2,
+            "Expected at least 2 columns, got {}",
+            cursor.columns().len()
+        );
 
         // Fetch first row
-        let result = conn.scroll(&mut cursor, FetchOrientation::First, 0).await
+        let result = conn
+            .scroll(&mut cursor, FetchOrientation::First, 0)
+            .await
             .expect("Failed to scroll to first");
 
         assert!(!result.is_empty(), "Should have at least one row");
         assert_eq!(result.position, 1, "Position should be 1 after First");
 
         // Close cursor
-        conn.close_cursor(&mut cursor).await.expect("Failed to close cursor");
+        conn.close_cursor(&mut cursor)
+            .await
+            .expect("Failed to close cursor");
         assert!(!cursor.is_open());
 
         conn.close().await.expect("Failed to close connection");
@@ -1951,48 +2390,63 @@ mod scrollable_cursor_tests {
         for i in 1..=10 {
             conn.execute(
                 "INSERT INTO scroll_test (id, name) VALUES (:1, :2)",
-                &[(i as i64).into(), format!("Row {}", i).into()]
-            ).await.expect("Failed to insert");
+                &[(i as i64).into(), format!("Row {}", i).into()],
+            )
+            .await
+            .expect("Failed to insert");
         }
         conn.commit().await.expect("Failed to commit");
 
         // Open scrollable cursor
-        let mut cursor = conn.open_scrollable_cursor(
-            "SELECT id, name FROM scroll_test ORDER BY id"
-        ).await.expect("Failed to open cursor");
+        let mut cursor = conn
+            .open_scrollable_cursor("SELECT id, name FROM scroll_test ORDER BY id")
+            .await
+            .expect("Failed to open cursor");
 
         // Go to first
-        let first = conn.scroll(&mut cursor, FetchOrientation::First, 0).await
+        let first = conn
+            .scroll(&mut cursor, FetchOrientation::First, 0)
+            .await
             .expect("Failed to scroll first");
         assert_eq!(first.position, 1);
         assert_eq!(first.rows[0].get_string(1), Some("Row 1"));
 
         // Go to last
-        let last = conn.scroll(&mut cursor, FetchOrientation::Last, 0).await
+        let last = conn
+            .scroll(&mut cursor, FetchOrientation::Last, 0)
+            .await
             .expect("Failed to scroll last");
         assert!(!last.rows.is_empty(), "Should have row for Last");
         assert_eq!(last.position, 10, "Position should be 10 at last row");
         assert_eq!(last.rows[0].get_string(1), Some("Row 10"));
 
         // Go to absolute position 5
-        let row5 = conn.scroll(&mut cursor, FetchOrientation::Absolute, 5).await
+        let row5 = conn
+            .scroll(&mut cursor, FetchOrientation::Absolute, 5)
+            .await
             .expect("Failed to scroll absolute");
         assert_eq!(row5.position, 5);
         assert_eq!(row5.rows[0].get_string(1), Some("Row 5"));
 
         // Go relative +2 (from 5 to 7)
-        let row7 = conn.scroll(&mut cursor, FetchOrientation::Relative, 2).await
+        let row7 = conn
+            .scroll(&mut cursor, FetchOrientation::Relative, 2)
+            .await
             .expect("Failed to scroll relative forward");
         assert_eq!(row7.position, 7);
         assert_eq!(row7.rows[0].get_string(1), Some("Row 7"));
 
         // Go relative -3 (from 7 to 4)
-        let row4 = conn.scroll(&mut cursor, FetchOrientation::Relative, -3).await
+        let row4 = conn
+            .scroll(&mut cursor, FetchOrientation::Relative, -3)
+            .await
             .expect("Failed to scroll relative backward");
         assert_eq!(row4.position, 4);
         assert_eq!(row4.rows[0].get_string(1), Some("Row 4"));
 
-        conn.close_cursor(&mut cursor).await.expect("Failed to close cursor");
+        conn.close_cursor(&mut cursor)
+            .await
+            .expect("Failed to close cursor");
         conn.rollback().await.expect("Failed to rollback");
         conn.close().await.expect("Failed to close");
     }
@@ -2003,26 +2457,35 @@ mod scrollable_cursor_tests {
         let conn = connect().await.expect("Failed to connect");
 
         // Open cursor on a table with known data
-        let mut cursor = conn.open_scrollable_cursor(
-            "SELECT emp_id FROM test_employees ORDER BY emp_id"
-        ).await.expect("Failed to open cursor");
+        let mut cursor = conn
+            .open_scrollable_cursor("SELECT emp_id FROM test_employees ORDER BY emp_id")
+            .await
+            .expect("Failed to open cursor");
 
         // Go to first row - should succeed
-        let first = conn.scroll(&mut cursor, FetchOrientation::First, 0).await
+        let first = conn
+            .scroll(&mut cursor, FetchOrientation::First, 0)
+            .await
             .expect("Failed to scroll first");
         assert!(!first.is_empty(), "Should have data at first position");
 
         // Go to last row - should succeed
-        let last = conn.scroll(&mut cursor, FetchOrientation::Last, 0).await
+        let last = conn
+            .scroll(&mut cursor, FetchOrientation::Last, 0)
+            .await
             .expect("Failed to scroll last");
         assert!(!last.is_empty(), "Should have data at last position");
 
         // Go back to first
-        let back_first = conn.scroll(&mut cursor, FetchOrientation::First, 0).await
+        let back_first = conn
+            .scroll(&mut cursor, FetchOrientation::First, 0)
+            .await
             .expect("Failed to scroll back to first");
         assert!(!back_first.is_empty());
 
-        conn.close_cursor(&mut cursor).await.expect("Failed to close cursor");
+        conn.close_cursor(&mut cursor)
+            .await
+            .expect("Failed to close cursor");
         conn.close().await.expect("Failed to close");
     }
 }
@@ -2037,10 +2500,10 @@ mod lob_bind_tests {
         let conn = connect().await.expect("Failed to connect");
 
         // First, select a LOB from an existing table to get a locator
-        let result = conn.query(
-            "SELECT val_clob FROM test_data_types WHERE id = 1",
-            &[]
-        ).await.expect("Failed to select LOB");
+        let result = conn
+            .query("SELECT val_clob FROM test_data_types WHERE id = 1", &[])
+            .await
+            .expect("Failed to select LOB");
 
         if result.row_count() == 0 {
             println!("No LOB test data found - skipping test");
@@ -2066,10 +2529,10 @@ mod lob_bind_tests {
 
         // Now use this LOB in a bind parameter
         // This tests that we can properly serialize a LOB locator as a bind parameter
-        let result2 = conn.query(
-            "SELECT DBMS_LOB.GETLENGTH(:1) FROM DUAL",
-            &[lob_value]
-        ).await.expect("Failed to query with LOB bind");
+        let result2 = conn
+            .query("SELECT DBMS_LOB.GETLENGTH(:1) FROM DUAL", &[lob_value])
+            .await
+            .expect("Failed to query with LOB bind");
 
         assert_eq!(result2.row_count(), 1);
         println!("Result value: {:?}", result2.rows[0].values()[0]);
@@ -2082,7 +2545,12 @@ mod lob_bind_tests {
             Value::Number(n) => n.as_str().parse::<i64>().unwrap_or(0),
             _ => 0,
         };
-        assert!(length > 0, "LOB length should be > 0, got {} (original size: {})", length, lob_size);
+        assert!(
+            length > 0,
+            "LOB length should be > 0, got {} (original size: {})",
+            length,
+            lob_size
+        );
 
         conn.close().await.expect("Failed to close");
     }
@@ -2107,10 +2575,10 @@ mod lob_bind_tests {
         conn.commit().await.expect("Failed to commit");
 
         // Select the LOB to get a locator
-        let result = conn.query(
-            "SELECT data FROM lob_bind_test WHERE id = 1",
-            &[]
-        ).await.expect("Failed to select LOB");
+        let result = conn
+            .query("SELECT data FROM lob_bind_test WHERE id = 1", &[])
+            .await
+            .expect("Failed to select LOB");
 
         assert_eq!(result.row_count(), 1);
         let lob_value = result.rows[0].values()[0].clone();
@@ -2131,14 +2599,19 @@ mod lob_bind_tests {
         // This verifies that the LOB locator is properly serialized
         conn.execute(
             "INSERT INTO lob_bind_test (id, data) SELECT 2, :1 FROM DUAL",
-            &[lob_value]
-        ).await.expect("Failed to insert with LOB bind");
+            &[lob_value],
+        )
+        .await
+        .expect("Failed to insert with LOB bind");
 
         // Verify the copy by selecting both rows
-        let verify = conn.query(
-            "SELECT id FROM lob_bind_test WHERE id IN (1, 2) ORDER BY id",
-            &[]
-        ).await.expect("Failed to verify");
+        let verify = conn
+            .query(
+                "SELECT id FROM lob_bind_test WHERE id IN (1, 2) ORDER BY id",
+                &[],
+            )
+            .await
+            .expect("Failed to verify");
 
         assert_eq!(verify.row_count(), 2, "Should have 2 rows after copy");
 
@@ -2150,25 +2623,31 @@ mod lob_bind_tests {
     #[tokio::test]
     #[ignore = "requires Oracle database"]
     async fn test_create_temp_clob() {
-        use oracle_rs::{OracleType, LobData};
+        use oracle_rs::{LobData, OracleType};
 
         let conn = connect().await.expect("Failed to connect");
 
         // Create a temporary CLOB
-        let locator = conn.create_temp_lob(OracleType::Clob)
-            .await.expect("Failed to create temp CLOB");
+        let locator = conn
+            .create_temp_lob(OracleType::Clob)
+            .await
+            .expect("Failed to create temp CLOB");
 
         println!("Created temp CLOB locator");
 
         // Write data to the temporary CLOB
         let test_content = "This is test content for temporary CLOB";
         conn.write_clob(&locator, 1, test_content)
-            .await.expect("Failed to write to temp CLOB");
+            .await
+            .expect("Failed to write to temp CLOB");
 
         println!("Wrote {} bytes to temp CLOB", test_content.len());
 
         // Read the content back
-        let data = conn.read_lob(&locator).await.expect("Failed to read temp CLOB");
+        let data = conn
+            .read_lob(&locator)
+            .await
+            .expect("Failed to read temp CLOB");
         match data {
             LobData::String(s) => {
                 assert_eq!(s, test_content, "CLOB content should match");
@@ -2187,25 +2666,31 @@ mod lob_bind_tests {
     #[tokio::test]
     #[ignore = "requires Oracle database"]
     async fn test_create_temp_blob() {
-        use oracle_rs::{OracleType, LobData};
+        use oracle_rs::{LobData, OracleType};
 
         let conn = connect().await.expect("Failed to connect");
 
         // Create a temporary BLOB
-        let locator = conn.create_temp_lob(OracleType::Blob)
-            .await.expect("Failed to create temp BLOB");
+        let locator = conn
+            .create_temp_lob(OracleType::Blob)
+            .await
+            .expect("Failed to create temp BLOB");
 
         println!("Created temp BLOB locator");
 
         // Write data to the temporary BLOB
         let test_data: Vec<u8> = (0..100).collect();
         conn.write_blob(&locator, 1, &test_data)
-            .await.expect("Failed to write to temp BLOB");
+            .await
+            .expect("Failed to write to temp BLOB");
 
         println!("Wrote {} bytes to temp BLOB", test_data.len());
 
         // Read the content back
-        let data = conn.read_lob(&locator).await.expect("Failed to read temp BLOB");
+        let data = conn
+            .read_lob(&locator)
+            .await
+            .expect("Failed to read temp BLOB");
         match data {
             LobData::Bytes(b) => {
                 assert_eq!(b.to_vec(), test_data, "BLOB content should match");
@@ -2219,35 +2704,42 @@ mod lob_bind_tests {
         conn.close().await.expect("Failed to close");
     }
 
-    /// Test that binding temp LOB to INSERT fails gracefully
-    /// This is a known limitation - use EMPTY_CLOB() workaround instead
+    /// Test binding a temporary LOB to INSERT.
     #[tokio::test]
     #[ignore = "requires Oracle database"]
     async fn test_temp_lob_insert() {
-        use oracle_rs::{OracleType, LobValue};
+        use oracle_rs::{LobData, LobValue, OracleType};
 
         let conn = connect().await.expect("Failed to connect");
 
         // Create test table with CLOB column
         conn.execute(
-            "BEGIN EXECUTE IMMEDIATE 'CREATE TABLE temp_lob_test (id NUMBER, content CLOB)'; EXCEPTION WHEN OTHERS THEN IF SQLCODE != -955 THEN RAISE; END IF; END;",
+            "BEGIN EXECUTE IMMEDIATE 'CREATE TABLE temp_lob_insert_test (id NUMBER, content CLOB)'; EXCEPTION WHEN OTHERS THEN IF SQLCODE != -955 THEN RAISE; END IF; END;",
             &[]
         ).await.expect("Failed to create table");
 
         // Clean up existing data
-        conn.execute("DELETE FROM temp_lob_test WHERE id >= 100", &[]).await.ok();
+        conn.execute("DELETE FROM temp_lob_insert_test WHERE id >= 100", &[])
+            .await
+            .ok();
 
         // Create a temporary CLOB
-        let locator = conn.create_temp_lob(OracleType::Clob)
-            .await.expect("Failed to create temp CLOB");
+        let locator = conn
+            .create_temp_lob(OracleType::Clob)
+            .await
+            .expect("Failed to create temp CLOB");
 
         // Write data to the temporary CLOB
         let test_content = "This is test content inserted via temp LOB";
         conn.write_clob(&locator, 1, test_content)
-            .await.expect("Failed to write to temp CLOB");
+            .await
+            .expect("Failed to write to temp CLOB");
 
         // Debug: check LOB length after write
-        let lob_len = conn.lob_length(&locator).await.expect("Failed to get LOB length");
+        let lob_len = conn
+            .lob_length(&locator)
+            .await
+            .expect("Failed to get LOB length");
         println!("Temp CLOB length after write: {}", lob_len);
         println!("Temp CLOB locator bytes: {:?}", locator.locator_bytes());
         println!("Temp CLOB is_temp: {}", locator.is_temp());
@@ -2255,45 +2747,89 @@ mod lob_bind_tests {
 
         // First, try a simple query with the temp LOB (like the working test does with persistent LOB)
         println!("Testing temp LOB with DBMS_LOB.GETLENGTH via query...");
-        let result = conn.query(
-            "SELECT DBMS_LOB.GETLENGTH(:1) FROM DUAL",
-            &[Value::Lob(LobValue::Locator(locator.clone()))]
-        ).await.expect("Query with temp CLOB bind failed");
+        let result = conn
+            .query(
+                "SELECT DBMS_LOB.GETLENGTH(:1) FROM DUAL",
+                &[Value::Lob(LobValue::Locator(locator.clone()))],
+            )
+            .await
+            .expect("Query with temp CLOB bind failed");
         println!("Query result: {:?}", result.rows[0].values()[0]);
 
         // Try PL/SQL DBMS_LOB.GETLENGTH via execute (DML path)
         println!("Testing temp LOB with DBMS_LOB.GETLENGTH via PL/SQL execute...");
         conn.execute(
             "DECLARE v_len NUMBER; BEGIN v_len := DBMS_LOB.GETLENGTH(:1); END;",
-            &[Value::Lob(LobValue::Locator(locator.clone()))]
-        ).await.expect("PL/SQL read with temp CLOB bind failed");
+            &[Value::Lob(LobValue::Locator(locator.clone()))],
+        )
+        .await
+        .expect("PL/SQL read with temp CLOB bind failed");
         println!("PL/SQL read succeeded!");
 
-        // Try PL/SQL INSERT with temp LOB - this is expected to fail
-        // This is a known limitation: binding temp LOBs to INSERT doesn't work
-        println!("Attempting PL/SQL INSERT with temp LOB bind (expected to fail)...");
-        let insert_result = conn.execute(
-            "BEGIN INSERT INTO temp_lob_test (id, content) VALUES (100, :1); END;",
-            &[Value::Lob(LobValue::Locator(locator))]
-        ).await;
+        // Try PL/SQL INSERT with temp LOB bind.
+        println!("Attempting PL/SQL INSERT with temp LOB bind...");
+        let insert_result = conn
+            .execute(
+                "BEGIN INSERT INTO temp_lob_insert_test (id, content) VALUES (100, :1); END;",
+                &[Value::Lob(LobValue::Locator(locator))],
+            )
+            .await;
 
-        // Verify it fails with expected error
-        assert!(insert_result.is_err(), "Temp LOB INSERT should fail");
-        let err_msg = insert_result.err().unwrap().to_string();
-        assert!(
-            err_msg.contains("rejected") || err_msg.contains("closed"),
-            "Error should mention connection rejection: {}",
-            err_msg
-        );
-        println!("Confirmed: temp LOB INSERT fails as expected");
+        match insert_result {
+            Ok(_) => {
+                let verify = conn
+                    .query(
+                        "SELECT content FROM temp_lob_insert_test WHERE id = 100",
+                        &[],
+                    )
+                    .await
+                    .expect("Failed to query inserted temp LOB");
+                assert_eq!(verify.row_count(), 1);
 
-        // Note: For actual LOB inserts, use EMPTY_CLOB() workaround (see lob_workaround_tests)
+                match &verify.rows[0].values()[0] {
+                    Value::Lob(lob) => {
+                        let locator = lob.as_locator().expect("Expected inserted LOB locator");
+                        let inserted = conn
+                            .read_lob(locator)
+                            .await
+                            .expect("Failed to read inserted temp LOB");
+                        match inserted {
+                            LobData::String(s) => assert_eq!(s, test_content),
+                            LobData::Bytes(b) => {
+                                let text = String::from_utf8(b.to_vec()).expect("Invalid UTF-8");
+                                assert_eq!(text, test_content);
+                            }
+                        }
+                    }
+                    Value::String(s) => assert_eq!(s, test_content),
+                    other => panic!("Expected inserted LOB value, got {:?}", other),
+                }
+                println!("Temp LOB INSERT succeeded and content was verified");
 
-        // Need to reconnect since temp LOB insert closes connection
-        let conn = connect().await.expect("Failed to reconnect");
-        conn.execute("DELETE FROM temp_lob_test", &[]).await.ok();
-        conn.commit().await.ok();
-        conn.close().await.expect("Failed to close");
+                conn.execute("DELETE FROM temp_lob_insert_test WHERE id = 100", &[])
+                    .await
+                    .ok();
+                conn.commit().await.ok();
+                conn.close().await.expect("Failed to close");
+            }
+            Err(err) => {
+                let err_msg = err.to_string();
+                assert!(
+                    err_msg.contains("rejected") || err_msg.contains("closed"),
+                    "Error should mention connection rejection: {}",
+                    err_msg
+                );
+                println!("Confirmed: temp LOB INSERT fails as expected");
+
+                let cleanup_conn = connect().await.expect("Failed to reconnect");
+                cleanup_conn
+                    .execute("DELETE FROM temp_lob_insert_test WHERE id = 100", &[])
+                    .await
+                    .ok();
+                cleanup_conn.commit().await.ok();
+                cleanup_conn.close().await.expect("Failed to close");
+            }
+        }
     }
 }
 
@@ -2306,14 +2842,21 @@ mod json_tests {
     #[ignore = "requires Oracle database with JSON support (21c+)"]
     async fn test_json_select_simple() {
         let conn = connect().await.expect("Failed to connect");
+        if skip_on_11g(&conn, "JSON_OBJECT / native JSON (12c+)").await {
+            conn.close().await.ok();
+            return;
+        }
 
         // JSON_OBJECT returns VARCHAR2 by default, which is fine for older Oracle versions
         // Native JSON type columns are only available in Oracle 21c+
         // This test verifies we can at least parse JSON from a VARCHAR2 column
-        let result = conn.query(
-            "SELECT JSON_OBJECT('name' VALUE 'test', 'value' VALUE 42) as json_col FROM DUAL",
-            &[]
-        ).await.expect("Query should succeed");
+        let result = conn
+            .query(
+                "SELECT JSON_OBJECT('name' VALUE 'test', 'value' VALUE 42) as json_col FROM DUAL",
+                &[],
+            )
+            .await
+            .expect("Query should succeed");
 
         assert_eq!(result.row_count(), 1);
         let value = &result.rows[0].values()[0];
@@ -2328,8 +2871,8 @@ mod json_tests {
             Value::String(s) => {
                 // VARCHAR2 representation (19c and earlier)
                 // Parse the JSON string manually
-                let json: serde_json::Value = serde_json::from_str(s)
-                    .expect("Should be valid JSON string");
+                let json: serde_json::Value =
+                    serde_json::from_str(s).expect("Should be valid JSON string");
                 assert_eq!(json.get("name").and_then(|v| v.as_str()), Some("test"));
                 assert_eq!(json.get("value").and_then(|v| v.as_i64()), Some(42));
             }
@@ -2384,10 +2927,10 @@ mod json_tests {
         conn.commit().await.expect("Failed to commit");
 
         // Query the JSON data
-        let result = conn.query(
-            "SELECT id, data FROM json_test ORDER BY id",
-            &[]
-        ).await.expect("Failed to query JSON");
+        let result = conn
+            .query("SELECT id, data FROM json_test ORDER BY id", &[])
+            .await
+            .expect("Failed to query JSON");
 
         assert_eq!(result.row_count(), 2);
 
@@ -2453,26 +2996,35 @@ mod json_tests {
         let json_value = Value::Json(json_data.clone());
 
         // This test verifies that JSON bind parameters are correctly encoded as OSON
-        let insert_result = conn.execute(
-            "INSERT INTO json_bind_test (id, data) VALUES (1, :1)",
-            &[json_value]
-        ).await.expect("Failed to insert JSON bind parameter");
+        let insert_result = conn
+            .execute(
+                "INSERT INTO json_bind_test (id, data) VALUES (1, :1)",
+                &[json_value],
+            )
+            .await
+            .expect("Failed to insert JSON bind parameter");
 
         assert_eq!(insert_result.rows_affected, 1, "Should insert 1 row");
         conn.commit().await.expect("Failed to commit");
 
         // Verify by selecting back
-        let result = conn.query(
-            "SELECT data FROM json_bind_test WHERE id = 1",
-            &[]
-        ).await.expect("Failed to query");
+        let result = conn
+            .query("SELECT data FROM json_bind_test WHERE id = 1", &[])
+            .await
+            .expect("Failed to query");
 
         assert_eq!(result.row_count(), 1, "Should have 1 row");
 
         match result.rows[0].get(0) {
             Some(Value::Json(retrieved)) => {
-                assert_eq!(retrieved.get("product").and_then(|v| v.as_str()), Some("Widget"));
-                assert_eq!(retrieved.get("in_stock").and_then(|v| v.as_bool()), Some(true));
+                assert_eq!(
+                    retrieved.get("product").and_then(|v| v.as_str()),
+                    Some("Widget")
+                );
+                assert_eq!(
+                    retrieved.get("in_stock").and_then(|v| v.as_bool()),
+                    Some(true)
+                );
                 assert_eq!(retrieved.get("price").and_then(|v| v.as_f64()), Some(19.99));
                 // Check array
                 if let Some(tags) = retrieved.get("tags").and_then(|v| v.as_array()) {
@@ -2501,10 +3053,7 @@ mod json_tests {
         let conn = connect().await.expect("Failed to connect");
 
         // Query a NULL JSON value
-        let result = conn.query(
-            "SELECT CAST(NULL AS JSON) FROM DUAL",
-            &[]
-        ).await;
+        let result = conn.query("SELECT CAST(NULL AS JSON) FROM DUAL", &[]).await;
 
         match result {
             Ok(result) => {
@@ -2532,7 +3081,7 @@ mod json_tests {
 
 mod vector_tests {
     use super::*;
-    use oracle_rs::{OracleVector, VectorData, Value};
+    use oracle_rs::{OracleVector, Value, VectorData};
 
     #[tokio::test]
     #[ignore = "requires Oracle 23ai database"]
@@ -2582,18 +3131,25 @@ mod vector_tests {
         conn.execute("DELETE FROM test_vector_f32", &[]).await.ok();
 
         // Insert a vector using SQL literal syntax
-        let result = conn.execute(
-            "INSERT INTO test_vector_f32 (id, embedding) VALUES (1, '[1.0, 2.0, 3.0]')",
-            &[]
-        ).await;
+        let result = conn
+            .execute(
+                "INSERT INTO test_vector_f32 (id, embedding) VALUES (1, '[1.0, 2.0, 3.0]')",
+                &[],
+            )
+            .await;
 
         match result {
             Ok(_) => {
                 conn.commit().await.expect("Failed to commit");
 
                 // Select the vector back
-                let query_result = conn.query("SELECT id, embedding FROM test_vector_f32 WHERE id = 1", &[])
-                    .await.expect("Query failed");
+                let query_result = conn
+                    .query(
+                        "SELECT id, embedding FROM test_vector_f32 WHERE id = 1",
+                        &[],
+                    )
+                    .await
+                    .expect("Query failed");
 
                 assert_eq!(query_result.row_count(), 1);
                 let row = &query_result.rows[0];
@@ -2656,18 +3212,22 @@ mod vector_tests {
         let vector = OracleVector::float32(vec![0.1, 0.2, 0.3, 0.4]);
 
         // Insert using bind parameter
-        let result = conn.execute(
-            "INSERT INTO test_vector_bind (id, embedding) VALUES (:1, :2)",
-            &[Value::Integer(1), Value::Vector(vector.clone())]
-        ).await;
+        let result = conn
+            .execute(
+                "INSERT INTO test_vector_bind (id, embedding) VALUES (:1, :2)",
+                &[Value::Integer(1), Value::Vector(vector.clone())],
+            )
+            .await;
 
         match result {
             Ok(_) => {
                 conn.commit().await.expect("Failed to commit");
 
                 // Query back
-                let query_result = conn.query("SELECT embedding FROM test_vector_bind WHERE id = 1", &[])
-                    .await.expect("Query failed");
+                let query_result = conn
+                    .query("SELECT embedding FROM test_vector_bind WHERE id = 1", &[])
+                    .await
+                    .expect("Query failed");
 
                 assert_eq!(query_result.row_count(), 1);
                 let vector_value = query_result.rows[0].get(0).expect("No vector");
@@ -2718,17 +3278,21 @@ mod vector_tests {
 
         // Insert using bind parameter
         let vector = OracleVector::float64(vec![1.5, 2.5]);
-        let result = conn.execute(
-            "INSERT INTO test_vector_f64 (id, embedding) VALUES (:1, :2)",
-            &[Value::Integer(1), Value::Vector(vector)]
-        ).await;
+        let result = conn
+            .execute(
+                "INSERT INTO test_vector_f64 (id, embedding) VALUES (:1, :2)",
+                &[Value::Integer(1), Value::Vector(vector)],
+            )
+            .await;
 
         match result {
             Ok(_) => {
                 conn.commit().await.expect("Failed to commit");
 
-                let query_result = conn.query("SELECT embedding FROM test_vector_f64 WHERE id = 1", &[])
-                    .await.expect("Query failed");
+                let query_result = conn
+                    .query("SELECT embedding FROM test_vector_f64 WHERE id = 1", &[])
+                    .await
+                    .expect("Query failed");
 
                 if let Some(Value::Vector(v)) = query_result.rows.get(0).and_then(|r| r.get(0)) {
                     match v.data() {
@@ -2770,17 +3334,21 @@ mod vector_tests {
 
         // Insert using bind parameter
         let vector = OracleVector::int8(vec![-128, -1, 0, 1, 127]);
-        let result = conn.execute(
-            "INSERT INTO test_vector_i8 (id, embedding) VALUES (:1, :2)",
-            &[Value::Integer(1), Value::Vector(vector)]
-        ).await;
+        let result = conn
+            .execute(
+                "INSERT INTO test_vector_i8 (id, embedding) VALUES (:1, :2)",
+                &[Value::Integer(1), Value::Vector(vector)],
+            )
+            .await;
 
         match result {
             Ok(_) => {
                 conn.commit().await.expect("Failed to commit");
 
-                let query_result = conn.query("SELECT embedding FROM test_vector_i8 WHERE id = 1", &[])
-                    .await.expect("Query failed");
+                let query_result = conn
+                    .query("SELECT embedding FROM test_vector_i8 WHERE id = 1", &[])
+                    .await
+                    .expect("Query failed");
 
                 if let Some(Value::Vector(v)) = query_result.rows.get(0).and_then(|r| r.get(0)) {
                     match v.data() {
@@ -2824,17 +3392,21 @@ mod vector_tests {
         conn.execute("DELETE FROM test_vector_null", &[]).await.ok();
 
         // Insert row with NULL vector
-        let result = conn.execute(
-            "INSERT INTO test_vector_null (id, embedding) VALUES (1, NULL)",
-            &[]
-        ).await;
+        let result = conn
+            .execute(
+                "INSERT INTO test_vector_null (id, embedding) VALUES (1, NULL)",
+                &[],
+            )
+            .await;
 
         match result {
             Ok(_) => {
                 conn.commit().await.expect("Failed to commit");
 
-                let query_result = conn.query("SELECT embedding FROM test_vector_null WHERE id = 1", &[])
-                    .await.expect("Query failed");
+                let query_result = conn
+                    .query("SELECT embedding FROM test_vector_null WHERE id = 1", &[])
+                    .await
+                    .expect("Query failed");
 
                 assert_eq!(query_result.row_count(), 1);
                 let value = query_result.rows[0].get(0).expect("No column");
@@ -2870,10 +3442,12 @@ mod vector_tests {
 
         // Use the convenient .into() syntax for vectors
         let embedding: Vec<f32> = vec![1.0, 2.0, 3.0];
-        let result = conn.execute(
-            "INSERT INTO test_vector_conv (id, embedding) VALUES (:1, :2)",
-            &[1i64.into(), embedding.into()]
-        ).await;
+        let result = conn
+            .execute(
+                "INSERT INTO test_vector_conv (id, embedding) VALUES (:1, :2)",
+                &[1i64.into(), embedding.into()],
+            )
+            .await;
 
         match result {
             Ok(_) => {
@@ -2904,10 +3478,12 @@ mod plsql_tests {
         let conn = connect().await.expect("Failed to connect");
 
         // Simple PL/SQL block with OUT parameter
-        let result = conn.execute_plsql(
-            "BEGIN :1 := 'Hello from PL/SQL'; END;",
-            &[BindParam::output(OracleType::Varchar, 100)]
-        ).await;
+        let result = conn
+            .execute_plsql(
+                "BEGIN :1 := 'Hello from PL/SQL'; END;",
+                &[BindParam::output(OracleType::Varchar, 100)],
+            )
+            .await;
 
         match result {
             Ok(plsql_result) => {
@@ -2934,10 +3510,12 @@ mod plsql_tests {
         let conn = connect().await.expect("Failed to connect");
 
         // PL/SQL block with OUT number parameter
-        let result = conn.execute_plsql(
-            "BEGIN :1 := 42 + 58; END;",
-            &[BindParam::output(OracleType::Number, 22)]
-        ).await;
+        let result = conn
+            .execute_plsql(
+                "BEGIN :1 := 42 + 58; END;",
+                &[BindParam::output(OracleType::Number, 22)],
+            )
+            .await;
 
         match result {
             Ok(plsql_result) => {
@@ -2961,10 +3539,12 @@ mod plsql_tests {
         let conn = connect().await.expect("Failed to connect");
 
         // PL/SQL block with IN OUT parameter (modify value)
-        let result = conn.execute_plsql(
-            "BEGIN :1 := :1 * 2; END;",
-            &[BindParam::input_output(Value::Integer(21), 22)]
-        ).await;
+        let result = conn
+            .execute_plsql(
+                "BEGIN :1 := :1 * 2; END;",
+                &[BindParam::input_output(Value::Integer(21), 22)],
+            )
+            .await;
 
         match result {
             Ok(plsql_result) => {
@@ -2988,14 +3568,16 @@ mod plsql_tests {
         let conn = connect().await.expect("Failed to connect");
 
         // PL/SQL block with multiple OUT parameters
-        let result = conn.execute_plsql(
-            "BEGIN :1 := 100; :2 := 'test'; :3 := 3.14; END;",
-            &[
-                BindParam::output(OracleType::Number, 22),
-                BindParam::output(OracleType::Varchar, 100),
-                BindParam::output(OracleType::BinaryDouble, 8),
-            ]
-        ).await;
+        let result = conn
+            .execute_plsql(
+                "BEGIN :1 := 100; :2 := 'test'; :3 := 3.14; END;",
+                &[
+                    BindParam::output(OracleType::Number, 22),
+                    BindParam::output(OracleType::Varchar, 100),
+                    BindParam::output(OracleType::BinaryDouble, 8),
+                ],
+            )
+            .await;
 
         match result {
             Ok(plsql_result) => {
@@ -3050,26 +3632,30 @@ mod plsql_tests {
         let conn = connect().await.expect("Failed to connect");
 
         // Create a test procedure
-        let create_proc_result = conn.execute(
-            "CREATE OR REPLACE PROCEDURE test_out_proc(p_in IN NUMBER, p_out OUT VARCHAR2) IS
+        let create_proc_result = conn
+            .execute(
+                "CREATE OR REPLACE PROCEDURE test_out_proc(p_in IN NUMBER, p_out OUT VARCHAR2) IS
              BEGIN
                  p_out := 'Input was: ' || TO_CHAR(p_in);
              END;",
-            &[]
-        ).await;
+                &[],
+            )
+            .await;
 
         match create_proc_result {
             Ok(_) => {
                 println!("Test procedure created successfully");
 
                 // Call the procedure
-                let call_result = conn.execute_plsql(
-                    "BEGIN test_out_proc(:1, :2); END;",
-                    &[
-                        BindParam::input(Value::Integer(42)),
-                        BindParam::output(OracleType::Varchar, 100),
-                    ]
-                ).await;
+                let call_result = conn
+                    .execute_plsql(
+                        "BEGIN test_out_proc(:1, :2); END;",
+                        &[
+                            BindParam::input(Value::Integer(42)),
+                            BindParam::output(OracleType::Varchar, 100),
+                        ],
+                    )
+                    .await;
 
                 match call_result {
                     Ok(plsql_result) => {
@@ -3120,22 +3706,27 @@ mod lob_bind_param_tests {
         // INSERT with bind params
         conn.execute(
             "INSERT INTO bind_clob_test (id, content) VALUES (:1, :2)",
-            &[1i64.into(), "Hello World".into()]
-        ).await.expect("INSERT failed");
+            &[1i64.into(), "Hello World".into()],
+        )
+        .await
+        .expect("INSERT failed");
         conn.commit().await.expect("COMMIT failed");
 
         // SELECT without bind params
-        let result = conn.query(
-            "SELECT id, content FROM bind_clob_test WHERE id = 1",
-            &[]
-        ).await.expect("SELECT without bind failed");
+        let result = conn
+            .query("SELECT id, content FROM bind_clob_test WHERE id = 1", &[])
+            .await
+            .expect("SELECT without bind failed");
         assert_eq!(result.row_count(), 1);
 
         // SELECT with bind params - this was hanging before the fix
-        let result = conn.query(
-            "SELECT id, content FROM bind_clob_test WHERE id = :1",
-            &[Value::Integer(1)]
-        ).await.expect("SELECT with bind failed");
+        let result = conn
+            .query(
+                "SELECT id, content FROM bind_clob_test WHERE id = :1",
+                &[Value::Integer(1)],
+            )
+            .await
+            .expect("SELECT with bind failed");
         assert_eq!(result.row_count(), 1);
 
         // Verify data
@@ -3157,7 +3748,7 @@ mod lob_bind_param_tests {
 /// Tests for binding strings/bytes to LOB columns using workarounds
 mod lob_workaround_tests {
     use super::*;
-    use oracle_rs::{Value, LobData};
+    use oracle_rs::{BindParam, LobData, Value};
 
     /// Test inserting data into CLOB using EMPTY_CLOB() + FOR UPDATE pattern
     #[tokio::test]
@@ -3171,19 +3762,26 @@ mod lob_workaround_tests {
             &[]
         ).await.expect("Failed to create table");
 
-        conn.execute("DELETE FROM clob_workaround_test WHERE id = 1", &[]).await.ok();
+        conn.execute("DELETE FROM clob_workaround_test WHERE id = 1", &[])
+            .await
+            .ok();
 
         // Step 1: Insert with EMPTY_CLOB() placeholder
         conn.execute(
             "INSERT INTO clob_workaround_test (id, content) VALUES (:1, EMPTY_CLOB())",
-            &[1.into()]
-        ).await.expect("Failed to insert empty CLOB");
+            &[1.into()],
+        )
+        .await
+        .expect("Failed to insert empty CLOB");
 
         // Step 2: Select FOR UPDATE to get the LOB locator
-        let rows = conn.query(
-            "SELECT content FROM clob_workaround_test WHERE id = 1 FOR UPDATE",
-            &[]
-        ).await.expect("Failed to select for update");
+        let rows = conn
+            .query(
+                "SELECT content FROM clob_workaround_test WHERE id = 1 FOR UPDATE",
+                &[],
+            )
+            .await
+            .expect("Failed to select for update");
 
         assert_eq!(rows.row_count(), 1);
         let test_content = "This is the CLOB content inserted via EMPTY_CLOB workaround";
@@ -3202,10 +3800,10 @@ mod lob_workaround_tests {
         conn.commit().await.expect("Failed to commit");
 
         // Verify the content was written
-        let verify_rows = conn.query(
-            "SELECT content FROM clob_workaround_test WHERE id = 1",
-            &[]
-        ).await.expect("Failed to verify");
+        let verify_rows = conn
+            .query("SELECT content FROM clob_workaround_test WHERE id = 1", &[])
+            .await
+            .expect("Failed to verify");
 
         assert_eq!(verify_rows.row_count(), 1);
         match &verify_rows.rows[0].values()[0] {
@@ -3228,7 +3826,9 @@ mod lob_workaround_tests {
         }
 
         // Clean up
-        conn.execute("DELETE FROM clob_workaround_test WHERE id = 1", &[]).await.ok();
+        conn.execute("DELETE FROM clob_workaround_test WHERE id = 1", &[])
+            .await
+            .ok();
         conn.commit().await.expect("Failed to commit cleanup");
         conn.close().await.expect("Failed to close");
     }
@@ -3245,19 +3845,26 @@ mod lob_workaround_tests {
             &[]
         ).await.expect("Failed to create table");
 
-        conn.execute("DELETE FROM blob_workaround_test WHERE id = 1", &[]).await.ok();
+        conn.execute("DELETE FROM blob_workaround_test WHERE id = 1", &[])
+            .await
+            .ok();
 
         // Step 1: Insert with EMPTY_BLOB() placeholder
         conn.execute(
             "INSERT INTO blob_workaround_test (id, content) VALUES (:1, EMPTY_BLOB())",
-            &[1.into()]
-        ).await.expect("Failed to insert empty BLOB");
+            &[1.into()],
+        )
+        .await
+        .expect("Failed to insert empty BLOB");
 
         // Step 2: Select FOR UPDATE to get the LOB locator
-        let rows = conn.query(
-            "SELECT content FROM blob_workaround_test WHERE id = 1 FOR UPDATE",
-            &[]
-        ).await.expect("Failed to select for update");
+        let rows = conn
+            .query(
+                "SELECT content FROM blob_workaround_test WHERE id = 1 FOR UPDATE",
+                &[],
+            )
+            .await
+            .expect("Failed to select for update");
 
         assert_eq!(rows.row_count(), 1);
         let test_data: Vec<u8> = (0..100).map(|i| (i % 256) as u8).collect();
@@ -3276,10 +3883,10 @@ mod lob_workaround_tests {
         conn.commit().await.expect("Failed to commit");
 
         // Verify the content was written
-        let verify_rows = conn.query(
-            "SELECT content FROM blob_workaround_test WHERE id = 1",
-            &[]
-        ).await.expect("Failed to verify");
+        let verify_rows = conn
+            .query("SELECT content FROM blob_workaround_test WHERE id = 1", &[])
+            .await
+            .expect("Failed to verify");
 
         assert_eq!(verify_rows.row_count(), 1);
         match &verify_rows.rows[0].values()[0] {
@@ -3299,7 +3906,9 @@ mod lob_workaround_tests {
         }
 
         // Clean up
-        conn.execute("DELETE FROM blob_workaround_test WHERE id = 1", &[]).await.ok();
+        conn.execute("DELETE FROM blob_workaround_test WHERE id = 1", &[])
+            .await
+            .ok();
         conn.commit().await.expect("Failed to commit cleanup");
         conn.close().await.expect("Failed to close");
     }
@@ -3317,22 +3926,26 @@ mod lob_workaround_tests {
             &[]
         ).await.expect("Failed to create table");
 
-        conn.execute("DELETE FROM string_clob_test WHERE id = 1", &[]).await.ok();
+        conn.execute("DELETE FROM string_clob_test WHERE id = 1", &[])
+            .await
+            .ok();
 
         // Insert string directly - Oracle should convert to CLOB
         let test_string = "Hello, this is a small string that should work with CLOB columns";
         conn.execute(
             "INSERT INTO string_clob_test (id, content) VALUES (:1, :2)",
-            &[1.into(), test_string.into()]
-        ).await.expect("Failed to insert string as CLOB");
+            &[1.into(), test_string.into()],
+        )
+        .await
+        .expect("Failed to insert string as CLOB");
 
         conn.commit().await.expect("Failed to commit");
 
         // Verify the content
-        let rows = conn.query(
-            "SELECT content FROM string_clob_test WHERE id = 1",
-            &[]
-        ).await.expect("Failed to query");
+        let rows = conn
+            .query("SELECT content FROM string_clob_test WHERE id = 1", &[])
+            .await
+            .expect("Failed to query");
 
         assert_eq!(rows.row_count(), 1);
         match &rows.rows[0].values()[0] {
@@ -3354,7 +3967,9 @@ mod lob_workaround_tests {
         }
 
         // Clean up
-        conn.execute("DELETE FROM string_clob_test WHERE id = 1", &[]).await.ok();
+        conn.execute("DELETE FROM string_clob_test WHERE id = 1", &[])
+            .await
+            .ok();
         conn.commit().await.expect("Failed to commit cleanup");
         conn.close().await.expect("Failed to close");
     }
@@ -3364,34 +3979,50 @@ mod lob_workaround_tests {
     #[ignore = "requires Oracle database"]
     async fn test_dbms_lob_returning_into() {
         let conn = connect().await.expect("Failed to connect");
+        let test_id = 11_004;
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.subsec_nanos() % 100_000)
+            .unwrap_or(0);
+        let table_name = format!("lobret_{}_{}", std::process::id(), suffix);
 
         // Create test table
-        conn.execute(
-            "BEGIN EXECUTE IMMEDIATE 'CREATE TABLE dbms_lob_test (id NUMBER, content CLOB)'; EXCEPTION WHEN OTHERS THEN IF SQLCODE != -955 THEN RAISE; END IF; END;",
-            &[]
-        ).await.expect("Failed to create table");
+        let create_sql = format!("CREATE TABLE {} (id NUMBER, content CLOB)", table_name);
+        conn.execute(&create_sql, &[])
+            .await
+            .expect("Failed to create table");
 
-        conn.execute("DELETE FROM dbms_lob_test WHERE id = 1", &[]).await.ok();
+        conn.execute(
+            &format!("DELETE FROM {} WHERE id = {}", table_name, test_id),
+            &[],
+        )
+        .await
+        .ok();
 
         // Use PL/SQL to insert and get the LOB locator in one operation
-        conn.execute(
+        let plsql = format!(
             "DECLARE
                v_clob CLOB;
              BEGIN
-               INSERT INTO dbms_lob_test (id, content) VALUES (:1, EMPTY_CLOB())
+               INSERT INTO {} (id, content) VALUES (:1, EMPTY_CLOB())
                  RETURNING content INTO v_clob;
-               DBMS_LOB.WRITEAPPEND(v_clob, LENGTH('Test content via DBMS_LOB'), 'Test content via DBMS_LOB');
+               DBMS_LOB.WRITEAPPEND(
+                 v_clob,
+                 LENGTH('Test content via DBMS_LOB'),
+                 'Test content via DBMS_LOB'
+               );
              END;",
-            &[1.into()]
-        ).await.expect("Failed to execute PL/SQL");
+            table_name
+        );
+        conn.execute_plsql(&plsql, &[BindParam::input(test_id.into())])
+            .await
+            .expect("Failed to execute PL/SQL");
 
         conn.commit().await.expect("Failed to commit");
 
         // Verify
-        let rows = conn.query(
-            "SELECT content FROM dbms_lob_test WHERE id = 1",
-            &[]
-        ).await.expect("Failed to query");
+        let verify_sql = format!("SELECT content FROM {} WHERE id = {}", table_name, test_id);
+        let rows = conn.query(&verify_sql, &[]).await.expect("Failed to query");
 
         assert_eq!(rows.row_count(), 1);
         match &rows.rows[0].values()[0] {
@@ -3413,7 +4044,9 @@ mod lob_workaround_tests {
         }
 
         // Clean up
-        conn.execute("DELETE FROM dbms_lob_test WHERE id = 1", &[]).await.ok();
+        conn.execute(&format!("DROP TABLE {} PURGE", table_name), &[])
+            .await
+            .ok();
         conn.commit().await.expect("Failed to commit cleanup");
         conn.close().await.expect("Failed to close");
     }
@@ -3441,27 +4074,36 @@ mod ref_cursor_tests {
         // Insert test data
         conn.execute(
             "INSERT INTO ref_cursor_test (id, name) VALUES (1, 'Alice')",
-            &[]
-        ).await.expect("Failed to insert");
+            &[],
+        )
+        .await
+        .expect("Failed to insert");
         conn.execute(
             "INSERT INTO ref_cursor_test (id, name) VALUES (2, 'Bob')",
-            &[]
-        ).await.expect("Failed to insert");
+            &[],
+        )
+        .await
+        .expect("Failed to insert");
         conn.execute(
             "INSERT INTO ref_cursor_test (id, name) VALUES (3, 'Charlie')",
-            &[]
-        ).await.expect("Failed to insert");
+            &[],
+        )
+        .await
+        .expect("Failed to insert");
         conn.commit().await.expect("Failed to commit");
 
         // Execute PL/SQL that opens a REF CURSOR
-        let result = conn.execute_plsql(
-            "BEGIN OPEN :1 FOR SELECT id, name FROM ref_cursor_test ORDER BY id; END;",
-            &[BindParam::output_cursor()]
-        ).await.expect("Failed to execute PL/SQL");
+        let result = conn
+            .execute_plsql(
+                "BEGIN OPEN :1 FOR SELECT id, name FROM ref_cursor_test ORDER BY id; END;",
+                &[BindParam::output_cursor()],
+            )
+            .await
+            .expect("Failed to execute PL/SQL");
 
         // Get the cursor from OUT parameter
         assert!(!result.out_values.is_empty(), "Should have OUT values");
-        
+
         if let Value::Cursor(ref cursor) = result.out_values[0] {
             // Debug: print cursor info
             println!("Cursor ID: {}", cursor.cursor_id());
@@ -3474,9 +4116,16 @@ mod ref_cursor_tests {
             assert_eq!(cursor.column_count(), 2, "Cursor should have 2 columns");
 
             // Fetch rows from the cursor
-            let rows = conn.fetch_cursor(cursor).await.expect("Failed to fetch cursor");
+            let rows = conn
+                .fetch_cursor(cursor)
+                .await
+                .expect("Failed to fetch cursor");
 
-            println!("Fetched {} rows, has_more: {}", rows.row_count(), rows.has_more_rows);
+            println!(
+                "Fetched {} rows, has_more: {}",
+                rows.row_count(),
+                rows.has_more_rows
+            );
 
             assert_eq!(rows.row_count(), 3, "Should fetch 3 rows");
 
@@ -3507,15 +4156,19 @@ mod ref_cursor_tests {
             &[]
         ).await.expect("Failed to create table");
 
-        conn.execute("DELETE FROM ref_cursor_filter_test", &[]).await.ok();
+        conn.execute("DELETE FROM ref_cursor_filter_test", &[])
+            .await
+            .ok();
 
         // Insert test data
         for i in 1..=5 {
             let status = if i % 2 == 0 { "active" } else { "inactive" };
             conn.execute(
                 "INSERT INTO ref_cursor_filter_test (id, status) VALUES (:1, :2)",
-                &[i.into(), status.into()]
-            ).await.expect("Failed to insert");
+                &[i.into(), status.into()],
+            )
+            .await
+            .expect("Failed to insert");
         }
         conn.commit().await.expect("Failed to commit");
 
@@ -3526,8 +4179,11 @@ mod ref_cursor_tests {
         ).await.expect("Failed to execute PL/SQL");
 
         if let Value::Cursor(ref cursor) = result.out_values[0] {
-            let rows = conn.fetch_cursor(cursor).await.expect("Failed to fetch cursor");
-            
+            let rows = conn
+                .fetch_cursor(cursor)
+                .await
+                .expect("Failed to fetch cursor");
+
             // Should have 2 active records (id 2 and 4)
             assert_eq!(rows.row_count(), 2, "Should fetch 2 active rows");
         } else {
@@ -3535,7 +4191,9 @@ mod ref_cursor_tests {
         }
 
         // Clean up
-        conn.execute("DELETE FROM ref_cursor_filter_test", &[]).await.ok();
+        conn.execute("DELETE FROM ref_cursor_filter_test", &[])
+            .await
+            .ok();
         conn.commit().await.ok();
         conn.close().await.expect("Failed to close");
     }
@@ -3549,6 +4207,10 @@ mod ref_cursor_tests {
     #[ignore = "requires Oracle database"]
     async fn test_implicit_result_single() {
         let conn = connect().await.expect("Failed to connect");
+        if skip_on_11g(&conn, "implicit results").await {
+            conn.close().await.ok();
+            return;
+        }
 
         // Create test table
         conn.execute(
@@ -3559,33 +4221,61 @@ mod ref_cursor_tests {
         conn.execute("DELETE FROM implicit_test", &[]).await.ok();
 
         // Insert test data
-        conn.execute("INSERT INTO implicit_test (id, name) VALUES (1, 'Alice')", &[]).await.expect("Failed to insert");
-        conn.execute("INSERT INTO implicit_test (id, name) VALUES (2, 'Bob')", &[]).await.expect("Failed to insert");
-        conn.execute("INSERT INTO implicit_test (id, name) VALUES (3, 'Charlie')", &[]).await.expect("Failed to insert");
+        conn.execute(
+            "INSERT INTO implicit_test (id, name) VALUES (1, 'Alice')",
+            &[],
+        )
+        .await
+        .expect("Failed to insert");
+        conn.execute(
+            "INSERT INTO implicit_test (id, name) VALUES (2, 'Bob')",
+            &[],
+        )
+        .await
+        .expect("Failed to insert");
+        conn.execute(
+            "INSERT INTO implicit_test (id, name) VALUES (3, 'Charlie')",
+            &[],
+        )
+        .await
+        .expect("Failed to insert");
         conn.commit().await.expect("Failed to commit");
 
         // Execute PL/SQL block that returns implicit result set
-        let result = conn.execute_plsql(
-            "DECLARE
+        let result = conn
+            .execute_plsql(
+                "DECLARE
                c SYS_REFCURSOR;
              BEGIN
                OPEN c FOR SELECT id, name FROM implicit_test ORDER BY id;
                DBMS_SQL.RETURN_RESULT(c);
              END;",
-            &[]
-        ).await.expect("Failed to execute PL/SQL");
+                &[],
+            )
+            .await
+            .expect("Failed to execute PL/SQL");
 
         println!("Implicit results count: {}", result.implicit_results.len());
 
         // Should have 1 implicit result
-        assert_eq!(result.implicit_results.len(), 1, "Should have 1 implicit result");
+        assert_eq!(
+            result.implicit_results.len(),
+            1,
+            "Should have 1 implicit result"
+        );
 
         // Fetch rows from the implicit result
         let implicit_result = &result.implicit_results.results[0];
-        println!("Implicit result cursor_id: {}, columns: {}",
-            implicit_result.cursor_id, implicit_result.columns.len());
+        println!(
+            "Implicit result cursor_id: {}, columns: {}",
+            implicit_result.cursor_id,
+            implicit_result.columns.len()
+        );
 
-        let rows = conn.fetch_implicit_result(implicit_result).await.expect("Failed to fetch implicit result");
+        let rows = conn
+            .fetch_implicit_result(implicit_result)
+            .await
+            .expect("Failed to fetch implicit result");
 
         println!("Fetched {} rows", rows.row_count());
         assert_eq!(rows.row_count(), 3, "Should fetch 3 rows");
@@ -3601,6 +4291,10 @@ mod ref_cursor_tests {
     #[ignore = "requires Oracle database"]
     async fn test_implicit_result_multiple() {
         let conn = connect().await.expect("Failed to connect");
+        if skip_on_11g(&conn, "implicit results").await {
+            conn.close().await.ok();
+            return;
+        }
 
         // Create test tables
         conn.execute(
@@ -3617,16 +4311,42 @@ mod ref_cursor_tests {
         conn.execute("DELETE FROM implicit_orders", &[]).await.ok();
 
         // Insert test data
-        conn.execute("INSERT INTO implicit_users (id, name) VALUES (1, 'Alice')", &[]).await.expect("Failed to insert");
-        conn.execute("INSERT INTO implicit_users (id, name) VALUES (2, 'Bob')", &[]).await.expect("Failed to insert");
-        conn.execute("INSERT INTO implicit_orders (order_id, user_id, amount) VALUES (101, 1, 100)", &[]).await.expect("Failed to insert");
-        conn.execute("INSERT INTO implicit_orders (order_id, user_id, amount) VALUES (102, 1, 200)", &[]).await.expect("Failed to insert");
-        conn.execute("INSERT INTO implicit_orders (order_id, user_id, amount) VALUES (103, 2, 150)", &[]).await.expect("Failed to insert");
+        conn.execute(
+            "INSERT INTO implicit_users (id, name) VALUES (1, 'Alice')",
+            &[],
+        )
+        .await
+        .expect("Failed to insert");
+        conn.execute(
+            "INSERT INTO implicit_users (id, name) VALUES (2, 'Bob')",
+            &[],
+        )
+        .await
+        .expect("Failed to insert");
+        conn.execute(
+            "INSERT INTO implicit_orders (order_id, user_id, amount) VALUES (101, 1, 100)",
+            &[],
+        )
+        .await
+        .expect("Failed to insert");
+        conn.execute(
+            "INSERT INTO implicit_orders (order_id, user_id, amount) VALUES (102, 1, 200)",
+            &[],
+        )
+        .await
+        .expect("Failed to insert");
+        conn.execute(
+            "INSERT INTO implicit_orders (order_id, user_id, amount) VALUES (103, 2, 150)",
+            &[],
+        )
+        .await
+        .expect("Failed to insert");
         conn.commit().await.expect("Failed to commit");
 
         // Execute PL/SQL block that returns multiple implicit result sets
-        let result = conn.execute_plsql(
-            "DECLARE
+        let result = conn
+            .execute_plsql(
+                "DECLARE
                c1 SYS_REFCURSOR;
                c2 SYS_REFCURSOR;
              BEGIN
@@ -3635,23 +4355,35 @@ mod ref_cursor_tests {
                OPEN c2 FOR SELECT order_id, user_id, amount FROM implicit_orders ORDER BY order_id;
                DBMS_SQL.RETURN_RESULT(c2);
              END;",
-            &[]
-        ).await.expect("Failed to execute PL/SQL");
+                &[],
+            )
+            .await
+            .expect("Failed to execute PL/SQL");
 
         println!("Implicit results count: {}", result.implicit_results.len());
 
         // Should have 2 implicit results
-        assert_eq!(result.implicit_results.len(), 2, "Should have 2 implicit results");
+        assert_eq!(
+            result.implicit_results.len(),
+            2,
+            "Should have 2 implicit results"
+        );
 
         // Fetch first result set (users)
         let users_result = &result.implicit_results.results[0];
-        let users = conn.fetch_implicit_result(users_result).await.expect("Failed to fetch users");
+        let users = conn
+            .fetch_implicit_result(users_result)
+            .await
+            .expect("Failed to fetch users");
         println!("Users fetched: {} rows", users.row_count());
         assert_eq!(users.row_count(), 2, "Should fetch 2 users");
 
         // Fetch second result set (orders)
         let orders_result = &result.implicit_results.results[1];
-        let orders = conn.fetch_implicit_result(orders_result).await.expect("Failed to fetch orders");
+        let orders = conn
+            .fetch_implicit_result(orders_result)
+            .await
+            .expect("Failed to fetch orders");
         println!("Orders fetched: {} rows", orders.row_count());
         assert_eq!(orders.row_count(), 3, "Should fetch 3 orders");
 
@@ -3667,6 +4399,10 @@ mod ref_cursor_tests {
     #[ignore = "requires Oracle database"]
     async fn test_implicit_result_empty() {
         let conn = connect().await.expect("Failed to connect");
+        if skip_on_11g(&conn, "implicit results").await {
+            conn.close().await.ok();
+            return;
+        }
 
         // Create test table
         conn.execute(
@@ -3678,22 +4414,32 @@ mod ref_cursor_tests {
         conn.commit().await.expect("Failed to commit");
 
         // Execute PL/SQL block that returns empty result set
-        let result = conn.execute_plsql(
-            "DECLARE
+        let result = conn
+            .execute_plsql(
+                "DECLARE
                c SYS_REFCURSOR;
              BEGIN
                OPEN c FOR SELECT id FROM implicit_empty;
                DBMS_SQL.RETURN_RESULT(c);
              END;",
-            &[]
-        ).await.expect("Failed to execute PL/SQL");
+                &[],
+            )
+            .await
+            .expect("Failed to execute PL/SQL");
 
         // Should have 1 implicit result even if empty
-        assert_eq!(result.implicit_results.len(), 1, "Should have 1 implicit result");
+        assert_eq!(
+            result.implicit_results.len(),
+            1,
+            "Should have 1 implicit result"
+        );
 
         // Fetch - should return 0 rows
         let implicit_result = &result.implicit_results.results[0];
-        let rows = conn.fetch_implicit_result(implicit_result).await.expect("Failed to fetch");
+        let rows = conn
+            .fetch_implicit_result(implicit_result)
+            .await
+            .expect("Failed to fetch");
         assert_eq!(rows.row_count(), 0, "Should fetch 0 rows");
 
         conn.close().await.expect("Failed to close");
@@ -3715,10 +4461,13 @@ mod bfile_tests {
         // Create a BFILE locator using BFILENAME function
         // Note: The directory doesn't need to exist for this test - we're just
         // testing that we can create and parse BFILE locators
-        let result = conn.query(
-            "SELECT BFILENAME('TEST_DIR', 'test_file.txt') FROM DUAL",
-            &[]
-        ).await.expect("Failed to execute BFILENAME query");
+        let result = conn
+            .query(
+                "SELECT BFILENAME('TEST_DIR', 'test_file.txt') FROM DUAL",
+                &[],
+            )
+            .await
+            .expect("Failed to execute BFILENAME query");
 
         assert_eq!(result.row_count(), 1, "Should return 1 row");
 
@@ -3734,7 +4483,8 @@ mod bfile_tests {
                 assert!(locator.is_bfile(), "Locator should be BFILE type");
 
                 // Get and verify the directory/filename from locator
-                let (dir, file) = locator.get_file_name()
+                let (dir, file) = locator
+                    .get_file_name()
                     .expect("Should be able to parse BFILE locator");
 
                 assert_eq!(dir, "TEST_DIR", "Directory should be TEST_DIR");
@@ -3759,10 +4509,13 @@ mod bfile_tests {
         let conn = connect().await.expect("Failed to connect");
 
         // Create a BFILE locator for a non-existent file
-        let result = conn.query(
-            "SELECT BFILENAME('NONEXISTENT_DIR', 'nonexistent.txt') FROM DUAL",
-            &[]
-        ).await.expect("Failed to execute BFILENAME query");
+        let result = conn
+            .query(
+                "SELECT BFILENAME('NONEXISTENT_DIR', 'nonexistent.txt') FROM DUAL",
+                &[],
+            )
+            .await
+            .expect("Failed to execute BFILENAME query");
 
         let row = &result.rows[0];
         let bfile_value = row.values().get(0).expect("Missing BFILE value");
@@ -3784,16 +4537,21 @@ mod bfile_tests {
                     Err(e) => {
                         // ORA-22285: non-existent directory or file for FILEEXISTS operation
                         // Or connection reset if Oracle rejects the operation entirely
-                        println!("BFILE exists check returned error (expected for non-existent dir): {}", e);
+                        println!(
+                            "BFILE exists check returned error (expected for non-existent dir): {}",
+                            e
+                        );
                         let err_str = e.to_string();
                         assert!(
-                            err_str.contains("22285") ||
-                            err_str.contains("directory") ||
-                            err_str.contains("reset") ||
-                            err_str.contains("ORA-") ||
-                            err_str.contains("closed") ||
-                            err_str.contains("privileges"),
-                            "Error should be about directory or connection: {}", e
+                            err_str.contains("22285")
+                                || err_str.contains("directory")
+                                || err_str.contains("reset")
+                                || err_str.contains("ORA-")
+                                || err_str.contains("closed")
+                                || err_str.contains("privileges")
+                                || err_str.contains("LOB operation failed"),
+                            "Error should be about directory or connection: {}",
+                            e
                         );
                     }
                 }
@@ -3821,16 +4579,18 @@ mod bfile_tests {
         // Insert a BFILE locator
         conn.execute(
             "INSERT INTO bfile_test (id, file_ref) VALUES (1, BFILENAME('MY_DIR', 'document.pdf'))",
-            &[]
-        ).await.expect("Failed to insert");
+            &[],
+        )
+        .await
+        .expect("Failed to insert");
 
         conn.commit().await.expect("Failed to commit");
 
         // Query it back
-        let result = conn.query(
-            "SELECT file_ref FROM bfile_test WHERE id = 1",
-            &[]
-        ).await.expect("Failed to query");
+        let result = conn
+            .query("SELECT file_ref FROM bfile_test WHERE id = 1", &[])
+            .await
+            .expect("Failed to query");
 
         assert_eq!(result.row_count(), 1);
 
@@ -3842,8 +4602,7 @@ mod bfile_tests {
                 let locator = lob.as_locator().expect("Expected BFILE locator");
                 assert!(locator.is_bfile(), "Should be BFILE type");
 
-                let (dir, file) = locator.get_file_name()
-                    .expect("Should parse BFILE locator");
+                let (dir, file) = locator.get_file_name().expect("Should parse BFILE locator");
 
                 assert_eq!(dir, "MY_DIR");
                 assert_eq!(file, "document.pdf");
@@ -3881,17 +4640,23 @@ mod statement_cache_tests {
         let sql = "SELECT 1 + :1 AS result FROM DUAL";
 
         // First execution - should parse and cache
-        let result1 = conn.query(sql, &[Value::Integer(1)]).await
+        let result1 = conn
+            .query(sql, &[Value::Integer(1)])
+            .await
             .expect("First query failed");
         assert_eq!(result1.row_count(), 1);
 
         // Second execution with different bind - should reuse cached cursor
-        let result2 = conn.query(sql, &[Value::Integer(2)]).await
+        let result2 = conn
+            .query(sql, &[Value::Integer(2)])
+            .await
             .expect("Second query failed");
         assert_eq!(result2.row_count(), 1);
 
         // Third execution
-        let result3 = conn.query(sql, &[Value::Integer(3)]).await
+        let result3 = conn
+            .query(sql, &[Value::Integer(3)])
+            .await
             .expect("Third query failed");
         assert_eq!(result3.row_count(), 1);
 
@@ -3908,7 +4673,9 @@ mod statement_cache_tests {
 
         // Execute multiple times - each should work without caching
         for i in 1..5 {
-            let result = conn.query(sql, &[Value::Integer(i)]).await
+            let result = conn
+                .query(sql, &[Value::Integer(i)])
+                .await
                 .expect("Query failed");
             assert_eq!(result.row_count(), 1);
         }
@@ -3950,20 +4717,28 @@ mod statement_cache_tests {
         let conn = connect_with_cache(20).await.expect("Failed to connect");
 
         // Execute different queries
-        let result1 = conn.query("SELECT 1 FROM DUAL", &[]).await
+        let result1 = conn
+            .query("SELECT 1 FROM DUAL", &[])
+            .await
             .expect("Query 1 failed");
         assert_eq!(result1.row_count(), 1);
 
-        let result2 = conn.query("SELECT 2 FROM DUAL", &[]).await
+        let result2 = conn
+            .query("SELECT 2 FROM DUAL", &[])
+            .await
             .expect("Query 2 failed");
         assert_eq!(result2.row_count(), 1);
 
-        let result3 = conn.query("SELECT 3 FROM DUAL", &[]).await
+        let result3 = conn
+            .query("SELECT 3 FROM DUAL", &[])
+            .await
             .expect("Query 3 failed");
         assert_eq!(result3.row_count(), 1);
 
         // Re-execute first query - should hit cache
-        let result1b = conn.query("SELECT 1 FROM DUAL", &[]).await
+        let result1b = conn
+            .query("SELECT 1 FROM DUAL", &[])
+            .await
             .expect("Query 1 second time failed");
         assert_eq!(result1b.row_count(), 1);
 
@@ -3990,12 +4765,16 @@ mod statement_cache_tests {
         for i in 1..=5 {
             conn.execute_dml_sql(
                 insert_sql,
-                &[Value::Integer(i), Value::String(format!("value{}", i))]
-            ).await.expect("Insert failed");
+                &[Value::Integer(i), Value::String(format!("value{}", i))],
+            )
+            .await
+            .expect("Insert failed");
         }
 
         // Verify by querying all rows
-        let result = conn.query("SELECT * FROM dml_cache_test ORDER BY id", &[]).await
+        let result = conn
+            .query("SELECT * FROM dml_cache_test ORDER BY id", &[])
+            .await
             .expect("Select query failed");
         assert_eq!(result.row_count(), 5, "Should have inserted 5 rows");
 
@@ -4016,10 +4795,17 @@ mod statement_cache_tests {
 
         // Execute same query multiple times with different bind values
         for i in 1..=3 {
-            let result = conn.query(
-                sql,
-                &[Value::Integer(i), Value::Integer(i * 10), Value::Integer(i * 100)]
-            ).await.expect("Multi-bind query failed");
+            let result = conn
+                .query(
+                    sql,
+                    &[
+                        Value::Integer(i),
+                        Value::Integer(i * 10),
+                        Value::Integer(i * 100),
+                    ],
+                )
+                .await
+                .expect("Multi-bind query failed");
             assert_eq!(result.row_count(), 1);
             assert_eq!(result.column_count(), 2);
         }
@@ -4038,7 +4824,9 @@ mod statement_cache_tests {
 
         // Execute same query multiple times
         for i in 1..=5 {
-            let result = conn.query(sql, &[Value::Integer(i), Value::Integer(i * 10)]).await
+            let result = conn
+                .query(sql, &[Value::Integer(i), Value::Integer(i * 10)])
+                .await
                 .expect("Query failed");
             assert_eq!(result.row_count(), 1);
         }
@@ -4091,7 +4879,11 @@ mod collection_tests {
                 println!("Element type: {:?}", t.element_type);
 
                 assert!(t.is_collection, "Should be a collection");
-                assert_eq!(t.collection_type, Some(CollectionType::Varray), "Should be VARRAY");
+                assert_eq!(
+                    t.collection_type,
+                    Some(CollectionType::Varray),
+                    "Should be VARRAY"
+                );
                 assert_eq!(t.name, "TEST_NUMBER_VARRAY");
             }
             Err(e) => {
@@ -4130,7 +4922,11 @@ mod collection_tests {
                 println!("Element type: {:?}", t.element_type);
 
                 assert!(t.is_collection, "Should be a collection");
-                assert_eq!(t.collection_type, Some(CollectionType::NestedTable), "Should be Nested Table");
+                assert_eq!(
+                    t.collection_type,
+                    Some(CollectionType::NestedTable),
+                    "Should be Nested Table"
+                );
                 assert_eq!(t.name, "TEST_STRING_TABLE");
             }
             Err(e) => {
@@ -4148,9 +4944,12 @@ mod collection_tests {
         let conn = connect().await.expect("Failed to connect");
 
         // Query current user
-        let result = conn.query("SELECT USER FROM DUAL", &[]).await
+        let result = conn
+            .query("SELECT USER FROM DUAL", &[])
+            .await
             .expect("Failed to get current user");
-        let current_user = result.rows[0].get(0)
+        let current_user = result.rows[0]
+            .get(0)
             .and_then(|v| v.as_str())
             .expect("No user returned");
 
@@ -4210,27 +5009,37 @@ mod collection_tests {
             &[],
         ).await;
 
-        let _ = conn.execute(
-            "CREATE OR REPLACE PROCEDURE test_varray_out_proc(p_out OUT test_number_varray) IS
+        let _ = conn
+            .execute(
+                "CREATE OR REPLACE PROCEDURE test_varray_out_proc(p_out OUT test_number_varray) IS
              BEGIN
                 p_out := test_number_varray(10, 20, 30, 40, 50);
              END;",
-            &[],
-        ).await.expect("Failed to create procedure");
+                &[],
+            )
+            .await
+            .expect("Failed to create procedure");
 
         // Get the type descriptor
-        let varray_type = conn.get_type("TEST_NUMBER_VARRAY").await
+        let varray_type = conn
+            .get_type("TEST_NUMBER_VARRAY")
+            .await
             .expect("Failed to get type");
 
         println!("Got type: {}.{}", varray_type.schema, varray_type.name);
         println!("Element type: {:?}", varray_type.element_type);
-        println!("Type OID: {:?}", varray_type.oid.as_ref().map(|o| format!("{:02x?}", o)));
+        println!(
+            "Type OID: {:?}",
+            varray_type.oid.as_ref().map(|o| format!("{:02x?}", o))
+        );
 
         // Execute the procedure with OUT parameter using execute_plsql
-        let result = conn.execute_plsql(
-            "BEGIN test_varray_out_proc(:1); END;",
-            &[BindParam::output_collection(&varray_type)],
-        ).await;
+        let result = conn
+            .execute_plsql(
+                "BEGIN test_varray_out_proc(:1); END;",
+                &[BindParam::output_collection(&varray_type)],
+            )
+            .await;
 
         match result {
             Ok(plsql_result) => {
@@ -4250,7 +5059,10 @@ mod collection_tests {
                         assert_eq!(coll.elements.len(), 5, "Should have 5 elements");
                     }
                     oracle_rs::row::Value::Bytes(bytes) => {
-                        println!("Got raw bytes (collection decoding pending): {} bytes", bytes.len());
+                        println!(
+                            "Got raw bytes (collection decoding pending): {} bytes",
+                            bytes.len()
+                        );
                         println!("Raw: {:02x?}", &bytes[..std::cmp::min(50, bytes.len())]);
                     }
                     other => {
@@ -4265,7 +5077,9 @@ mod collection_tests {
         }
 
         // Cleanup
-        let _ = conn.execute("DROP PROCEDURE test_varray_out_proc", &[]).await;
+        let _ = conn
+            .execute("DROP PROCEDURE test_varray_out_proc", &[])
+            .await;
 
         conn.close().await.expect("Failed to close");
     }
@@ -4287,26 +5101,33 @@ mod collection_tests {
             &[],
         ).await;
 
-        let _ = conn.execute(
-            "CREATE OR REPLACE PROCEDURE test_table_out_proc(p_out OUT test_string_table) IS
+        let _ = conn
+            .execute(
+                "CREATE OR REPLACE PROCEDURE test_table_out_proc(p_out OUT test_string_table) IS
              BEGIN
                 p_out := test_string_table('Hello', 'World', 'From', 'Oracle');
              END;",
-            &[],
-        ).await.expect("Failed to create procedure");
+                &[],
+            )
+            .await
+            .expect("Failed to create procedure");
 
         // Get the type descriptor
-        let table_type = conn.get_type("TEST_STRING_TABLE").await
+        let table_type = conn
+            .get_type("TEST_STRING_TABLE")
+            .await
             .expect("Failed to get type");
 
         println!("Got type: {}.{}", table_type.schema, table_type.name);
         println!("Element type: {:?}", table_type.element_type);
 
         // Execute the procedure with OUT parameter using execute_plsql
-        let result = conn.execute_plsql(
-            "BEGIN test_table_out_proc(:1); END;",
-            &[BindParam::output_collection(&table_type)],
-        ).await;
+        let result = conn
+            .execute_plsql(
+                "BEGIN test_table_out_proc(:1); END;",
+                &[BindParam::output_collection(&table_type)],
+            )
+            .await;
 
         match result {
             Ok(plsql_result) => {
@@ -4338,7 +5159,9 @@ mod collection_tests {
         }
 
         // Cleanup
-        let _ = conn.execute("DROP PROCEDURE test_table_out_proc", &[]).await;
+        let _ = conn
+            .execute("DROP PROCEDURE test_table_out_proc", &[])
+            .await;
 
         conn.close().await.expect("Failed to close");
     }
@@ -4351,6 +5174,10 @@ mod collection_tests {
         use oracle_rs::statement::BindParam;
 
         let conn = connect().await.expect("Failed to connect");
+        if skip_on_11g(&conn, "collection input binds").await {
+            conn.close().await.ok();
+            return;
+        }
 
         // Create test type and procedure
         let _ = conn.execute(
@@ -4362,8 +5189,9 @@ mod collection_tests {
         ).await;
 
         // Create procedure that takes IN varray (no OUT params)
-        let _ = conn.execute(
-            "CREATE OR REPLACE PROCEDURE test_varray_simple_proc(
+        let _ = conn
+            .execute(
+                "CREATE OR REPLACE PROCEDURE test_varray_simple_proc(
                 p_in IN test_number_varray
             ) IS
                 v_sum NUMBER := 0;
@@ -4375,11 +5203,15 @@ mod collection_tests {
                     DBMS_OUTPUT.PUT_LINE('Sum: ' || v_sum);
                 END IF;
             END;",
-            &[],
-        ).await.expect("Failed to create procedure");
+                &[],
+            )
+            .await
+            .expect("Failed to create procedure");
 
         // Get the type descriptor
-        let varray_type = conn.get_type("TEST_NUMBER_VARRAY").await
+        let varray_type = conn
+            .get_type("TEST_NUMBER_VARRAY")
+            .await
             .expect("Failed to get type");
 
         println!("Got type: {}.{}", varray_type.schema, varray_type.name);
@@ -4389,12 +5221,12 @@ mod collection_tests {
         let empty_coll = DbObject::collection("TEST_NUMBER_VARRAY");
 
         // Execute the procedure with empty collection
-        let result_empty = conn.execute_plsql(
-            "BEGIN test_varray_simple_proc(:1); END;",
-            &[
-                BindParam::input_collection(&varray_type, empty_coll),
-            ],
-        ).await;
+        let result_empty = conn
+            .execute_plsql(
+                "BEGIN test_varray_simple_proc(:1); END;",
+                &[BindParam::input_collection(&varray_type, empty_coll)],
+            )
+            .await;
 
         match result_empty {
             Ok(_) => {
@@ -4412,12 +5244,12 @@ mod collection_tests {
         coll.append(oracle_rs::row::Value::Integer(30));
 
         // Execute the procedure with full collection
-        let result = conn.execute_plsql(
-            "BEGIN test_varray_simple_proc(:1); END;",
-            &[
-                BindParam::input_collection(&varray_type, coll),
-            ],
-        ).await;
+        let result = conn
+            .execute_plsql(
+                "BEGIN test_varray_simple_proc(:1); END;",
+                &[BindParam::input_collection(&varray_type, coll)],
+            )
+            .await;
 
         match result {
             Ok(_) => {
@@ -4429,7 +5261,9 @@ mod collection_tests {
         }
 
         // Cleanup
-        let _ = conn.execute("DROP PROCEDURE test_varray_simple_proc", &[]).await;
+        let _ = conn
+            .execute("DROP PROCEDURE test_varray_simple_proc", &[])
+            .await;
 
         conn.close().await.expect("Failed to close");
     }
@@ -4442,6 +5276,10 @@ mod collection_tests {
         use oracle_rs::statement::BindParam;
 
         let conn = connect().await.expect("Failed to connect");
+        if skip_on_11g(&conn, "collection input binds").await {
+            conn.close().await.ok();
+            return;
+        }
 
         // Create test type and procedure
         let _ = conn.execute(
@@ -4453,8 +5291,9 @@ mod collection_tests {
         ).await;
 
         // Create procedure that takes IN varray and returns sum
-        let _ = conn.execute(
-            "CREATE OR REPLACE PROCEDURE test_varray_in_proc(
+        let _ = conn
+            .execute(
+                "CREATE OR REPLACE PROCEDURE test_varray_in_proc(
                 p_in IN test_number_varray,
                 p_sum OUT NUMBER
             ) IS
@@ -4466,11 +5305,15 @@ mod collection_tests {
                     END LOOP;
                 END IF;
             END;",
-            &[],
-        ).await.expect("Failed to create procedure");
+                &[],
+            )
+            .await
+            .expect("Failed to create procedure");
 
         // Get the type descriptor
-        let varray_type = conn.get_type("TEST_NUMBER_VARRAY").await
+        let varray_type = conn
+            .get_type("TEST_NUMBER_VARRAY")
+            .await
             .expect("Failed to get type");
 
         println!("Got type: {}.{}", varray_type.schema, varray_type.name);
@@ -4483,13 +5326,15 @@ mod collection_tests {
         coll.append(oracle_rs::row::Value::Integer(30));
 
         // Execute the procedure with IN and OUT parameters
-        let result = conn.execute_plsql(
-            "BEGIN test_varray_in_proc(:1, :2); END;",
-            &[
-                BindParam::input_collection(&varray_type, coll),
-                BindParam::output(oracle_rs::constants::OracleType::Number, 22),
-            ],
-        ).await;
+        let result = conn
+            .execute_plsql(
+                "BEGIN test_varray_in_proc(:1, :2); END;",
+                &[
+                    BindParam::input_collection(&varray_type, coll),
+                    BindParam::output(oracle_rs::constants::OracleType::Number, 22),
+                ],
+            )
+            .await;
 
         match result {
             Ok(plsql_result) => {
@@ -4523,7 +5368,9 @@ mod collection_tests {
         }
 
         // Cleanup
-        let _ = conn.execute("DROP PROCEDURE test_varray_in_proc", &[]).await;
+        let _ = conn
+            .execute("DROP PROCEDURE test_varray_in_proc", &[])
+            .await;
 
         conn.close().await.expect("Failed to close");
     }
@@ -4536,6 +5383,10 @@ mod collection_tests {
         use oracle_rs::statement::BindParam;
 
         let conn = connect().await.expect("Failed to connect");
+        if skip_on_11g(&conn, "collection input binds").await {
+            conn.close().await.ok();
+            return;
+        }
 
         // Create test type and procedure
         let _ = conn.execute(
@@ -4547,8 +5398,9 @@ mod collection_tests {
         ).await;
 
         // Create procedure that doubles each element
-        let _ = conn.execute(
-            "CREATE OR REPLACE PROCEDURE test_varray_double_proc(
+        let _ = conn
+            .execute(
+                "CREATE OR REPLACE PROCEDURE test_varray_double_proc(
                 p_arr IN test_number_varray,
                 p_result OUT test_number_varray
             ) IS
@@ -4561,11 +5413,15 @@ mod collection_tests {
                     END LOOP;
                 END IF;
             END;",
-            &[],
-        ).await.expect("Failed to create procedure");
+                &[],
+            )
+            .await
+            .expect("Failed to create procedure");
 
         // Get the type descriptor
-        let varray_type = conn.get_type("TEST_NUMBER_VARRAY").await
+        let varray_type = conn
+            .get_type("TEST_NUMBER_VARRAY")
+            .await
             .expect("Failed to get type");
 
         // Create collection with values [1, 2, 3]
@@ -4575,13 +5431,15 @@ mod collection_tests {
         coll.append(oracle_rs::row::Value::Integer(3));
 
         // Execute the procedure
-        let result = conn.execute_plsql(
-            "BEGIN test_varray_double_proc(:1, :2); END;",
-            &[
-                BindParam::input_collection(&varray_type, coll),
-                BindParam::output_collection(&varray_type),
-            ],
-        ).await;
+        let result = conn
+            .execute_plsql(
+                "BEGIN test_varray_double_proc(:1, :2); END;",
+                &[
+                    BindParam::input_collection(&varray_type, coll),
+                    BindParam::output_collection(&varray_type),
+                ],
+            )
+            .await;
 
         match result {
             Ok(plsql_result) => {
@@ -4599,8 +5457,7 @@ mod collection_tests {
                         // Elements should be [2, 4, 6]
                         let expected = [2i64, 4, 6];
                         for (i, exp) in expected.iter().enumerate() {
-                            let val = coll.elements[i].as_i64()
-                                .expect("Should be integer");
+                            let val = coll.elements[i].as_i64().expect("Should be integer");
                             assert_eq!(val, *exp, "Element {} should be doubled", i);
                         }
                     }
@@ -4615,7 +5472,9 @@ mod collection_tests {
         }
 
         // Cleanup
-        let _ = conn.execute("DROP PROCEDURE test_varray_double_proc", &[]).await;
+        let _ = conn
+            .execute("DROP PROCEDURE test_varray_double_proc", &[])
+            .await;
 
         conn.close().await.expect("Failed to close");
     }
@@ -4628,6 +5487,10 @@ mod collection_tests {
         use oracle_rs::statement::BindParam;
 
         let conn = connect().await.expect("Failed to connect");
+        if skip_on_11g(&conn, "collection input binds").await {
+            conn.close().await.ok();
+            return;
+        }
 
         // Create test type and procedure
         let _ = conn.execute(
@@ -4639,8 +5502,9 @@ mod collection_tests {
         ).await;
 
         // Create procedure that concatenates strings
-        let _ = conn.execute(
-            "CREATE OR REPLACE PROCEDURE test_table_concat_proc(
+        let _ = conn
+            .execute(
+                "CREATE OR REPLACE PROCEDURE test_table_concat_proc(
                 p_in IN test_string_table,
                 p_result OUT VARCHAR2
             ) IS
@@ -4655,11 +5519,15 @@ mod collection_tests {
                     END LOOP;
                 END IF;
             END;",
-            &[],
-        ).await.expect("Failed to create procedure");
+                &[],
+            )
+            .await
+            .expect("Failed to create procedure");
 
         // Get the type descriptor
-        let table_type = conn.get_type("TEST_STRING_TABLE").await
+        let table_type = conn
+            .get_type("TEST_STRING_TABLE")
+            .await
             .expect("Failed to get type");
 
         // Create collection with values
@@ -4668,13 +5536,15 @@ mod collection_tests {
         coll.append(oracle_rs::row::Value::String("World".to_string()));
 
         // Execute the procedure
-        let result = conn.execute_plsql(
-            "BEGIN test_table_concat_proc(:1, :2); END;",
-            &[
-                BindParam::input_collection(&table_type, coll),
-                BindParam::output(oracle_rs::constants::OracleType::Varchar, 200),
-            ],
-        ).await;
+        let result = conn
+            .execute_plsql(
+                "BEGIN test_table_concat_proc(:1, :2); END;",
+                &[
+                    BindParam::input_collection(&table_type, coll),
+                    BindParam::output(oracle_rs::constants::OracleType::Varchar, 200),
+                ],
+            )
+            .await;
 
         match result {
             Ok(plsql_result) => {
@@ -4697,7 +5567,9 @@ mod collection_tests {
         }
 
         // Cleanup
-        let _ = conn.execute("DROP PROCEDURE test_table_concat_proc", &[]).await;
+        let _ = conn
+            .execute("DROP PROCEDURE test_table_concat_proc", &[])
+            .await;
 
         conn.close().await.expect("Failed to close");
     }
@@ -4721,20 +5593,32 @@ mod statement_cache_reuse_tests {
         let result1 = conn.query(sql, &[]).await.expect("First query failed");
         assert_eq!(result1.row_count(), 1, "First query should return 1 row");
         let row1 = &result1.rows[0];
-        assert_eq!(row1.get_string(0), Some("hello"), "First query: greeting should be 'hello'");
+        assert_eq!(
+            row1.get_string(0),
+            Some("hello"),
+            "First query: greeting should be 'hello'"
+        );
 
         // Second execution of the same SQL — this is where the bug manifests.
         // With a stale cursor_id, Oracle returns corrupted data (None values).
         let result2 = conn.query(sql, &[]).await.expect("Second query failed");
         assert_eq!(result2.row_count(), 1, "Second query should return 1 row");
         let row2 = &result2.rows[0];
-        assert_eq!(row2.get_string(0), Some("hello"), "Second query: greeting should be 'hello', not None");
+        assert_eq!(
+            row2.get_string(0),
+            Some("hello"),
+            "Second query: greeting should be 'hello', not None"
+        );
 
         // Third execution for good measure
         let result3 = conn.query(sql, &[]).await.expect("Third query failed");
         assert_eq!(result3.row_count(), 1, "Third query should return 1 row");
         let row3 = &result3.rows[0];
-        assert_eq!(row3.get_string(0), Some("hello"), "Third query: greeting should be 'hello', not None");
+        assert_eq!(
+            row3.get_string(0),
+            Some("hello"),
+            "Third query: greeting should be 'hello', not None"
+        );
 
         conn.close().await.expect("Failed to close");
     }
@@ -4746,29 +5630,41 @@ mod statement_cache_reuse_tests {
         use oracle_rs::Value;
         let conn = connect().await.expect("Failed to connect");
 
-        conn.execute("CREATE TABLE test_cache_dml (id NUMBER, name VARCHAR2(50))", &[])
-            .await.expect("Failed to create table");
+        conn.execute(
+            "CREATE TABLE test_cache_dml (id NUMBER, name VARCHAR2(50))",
+            &[],
+        )
+        .await
+        .expect("Failed to create table");
 
         let sql = "INSERT INTO test_cache_dml (id, name) VALUES (:1, :2)";
 
         // First execution
-        let r1 = conn.execute(sql, &[Value::Integer(1), Value::from("Alice")])
-            .await.expect("First insert failed");
+        let r1 = conn
+            .execute(sql, &[Value::Integer(1), Value::from("Alice")])
+            .await
+            .expect("First insert failed");
         assert_eq!(r1.rows_affected, 1);
 
         // Second execution — same SQL, different params
-        let r2 = conn.execute(sql, &[Value::Integer(2), Value::from("Bob")])
-            .await.expect("Second insert failed");
+        let r2 = conn
+            .execute(sql, &[Value::Integer(2), Value::from("Bob")])
+            .await
+            .expect("Second insert failed");
         assert_eq!(r2.rows_affected, 1);
 
         // Verify both rows exist
-        let result = conn.query("SELECT id, name FROM test_cache_dml ORDER BY id", &[])
-            .await.expect("Select failed");
+        let result = conn
+            .query("SELECT id, name FROM test_cache_dml ORDER BY id", &[])
+            .await
+            .expect("Select failed");
         assert_eq!(result.row_count(), 2, "Should have 2 rows");
         assert_eq!(result.rows[0].get_string(1), Some("Alice"));
         assert_eq!(result.rows[1].get_string(1), Some("Bob"));
 
-        conn.execute("DROP TABLE test_cache_dml", &[]).await.expect("Failed to drop table");
+        conn.execute("DROP TABLE test_cache_dml", &[])
+            .await
+            .expect("Failed to drop table");
         conn.close().await.expect("Failed to close");
     }
 
@@ -4777,24 +5673,32 @@ mod statement_cache_reuse_tests {
     #[tokio::test]
     #[ignore = "requires Oracle database"]
     async fn test_cached_query_with_bind_params_returns_correct_values() {
-        use oracle_rs::Value;
         let conn = connect().await.expect("Failed to connect");
 
         let sql = "SELECT emp_id, first_name, salary FROM test_employees WHERE dept_id = :1 ORDER BY emp_id";
 
         // First execution — dept 1 (Engineering: John, Jane)
-        let r1 = conn.query(sql, &[1i64.into()]).await.expect("First query failed");
+        let r1 = conn
+            .query(sql, &[1i64.into()])
+            .await
+            .expect("First query failed");
         assert_eq!(r1.row_count(), 2, "Dept 1 should have 2 employees");
         assert_eq!(r1.rows[0].get_string(1), Some("John"));
         assert_eq!(r1.rows[1].get_string(1), Some("Jane"));
 
         // Second execution with different bind — dept 2 (Marketing: Bob)
-        let r2 = conn.query(sql, &[2i64.into()]).await.expect("Second query failed");
+        let r2 = conn
+            .query(sql, &[2i64.into()])
+            .await
+            .expect("Second query failed");
         assert_eq!(r2.row_count(), 1, "Dept 2 should have 1 employee");
         assert_eq!(r2.rows[0].get_string(1), Some("Bob"));
 
         // Third execution — back to dept 1, verify values aren't stale
-        let r3 = conn.query(sql, &[1i64.into()]).await.expect("Third query failed");
+        let r3 = conn
+            .query(sql, &[1i64.into()])
+            .await
+            .expect("Third query failed");
         assert_eq!(r3.row_count(), 2);
         assert_eq!(r3.rows[0].get_string(1), Some("John"));
 
@@ -4811,6 +5715,10 @@ mod json_nesting_tests {
     #[ignore = "requires Oracle database with JSON support (21c+)"]
     async fn test_json_nested_objects_and_arrays() {
         let conn = connect().await.expect("Failed to connect");
+        if skip_on_11g(&conn, "native JSON type (21c+)").await {
+            conn.close().await.ok();
+            return;
+        }
 
         conn.execute(
             "BEGIN EXECUTE IMMEDIATE 'CREATE TABLE json_nested_test (id NUMBER PRIMARY KEY, data JSON)'; EXCEPTION WHEN OTHERS THEN IF SQLCODE != -955 THEN RAISE; END IF; END;",
@@ -4829,8 +5737,10 @@ mod json_nesting_tests {
                 ),
                 'count' VALUE 2
             ))",
-            &[]
-        ).await.expect("Failed to insert nested JSON");
+            &[],
+        )
+        .await
+        .expect("Failed to insert nested JSON");
 
         // Insert simpler JSON for second row
         conn.execute(
@@ -4840,8 +5750,10 @@ mod json_nesting_tests {
 
         conn.commit().await.expect("Failed to commit");
 
-        let result = conn.query("SELECT id, data FROM json_nested_test ORDER BY id", &[])
-            .await.expect("Query failed");
+        let result = conn
+            .query("SELECT id, data FROM json_nested_test ORDER BY id", &[])
+            .await
+            .expect("Query failed");
 
         assert_eq!(result.row_count(), 2, "Should have 2 rows");
 
@@ -4852,21 +5764,120 @@ mod json_nesting_tests {
             assert!(members.is_some(), "Should have members array");
             let members = members.unwrap();
             assert_eq!(members.len(), 2);
-            assert_eq!(members[0].get("name").and_then(|v| v.as_str()), Some("Alice"));
-            assert_eq!(members[0].get("role").and_then(|v| v.as_str()), Some("lead"));
+            assert_eq!(
+                members[0].get("name").and_then(|v| v.as_str()),
+                Some("Alice")
+            );
+            assert_eq!(
+                members[0].get("role").and_then(|v| v.as_str()),
+                Some("lead")
+            );
             assert_eq!(members[1].get("name").and_then(|v| v.as_str()), Some("Bob"));
         } else {
-            panic!("Expected JSON value for row 1, got {:?}", result.rows[0].get(1));
+            panic!(
+                "Expected JSON value for row 1, got {:?}",
+                result.rows[0].get(1)
+            );
         }
 
         // Verify simpler row wasn't affected
         if let Some(Value::Json(json)) = result.rows[1].get(1) {
             assert_eq!(json.get("status").and_then(|v| v.as_str()), Some("active"));
         } else {
-            panic!("Expected JSON value for row 2, got {:?}", result.rows[1].get(1));
+            panic!(
+                "Expected JSON value for row 2, got {:?}",
+                result.rows[1].get(1)
+            );
         }
 
         conn.execute("DROP TABLE json_nested_test", &[]).await.ok();
+        conn.close().await.expect("Failed to close");
+    }
+}
+
+mod large_result_tests {
+    use super::*;
+    use oracle_rs::Value;
+
+    /// Query over 1 million rows through the multi-fetch path: the initial
+    /// prefetch from `query()` followed by hundreds of `fetch_more` round
+    /// trips. Previous versions broke on result sets spanning many fetch
+    /// round trips (dropped, duplicated, or corrupted rows), so this asserts
+    /// the exact row count and that every value arrives in sequence.
+    #[tokio::test]
+    #[ignore = "requires Oracle database"]
+    async fn test_query_over_one_million_rows() {
+        // 1000 x 1024 cross join = 1,024,000 rows, numbered 1..=N by ROWNUM
+        // in fetch order. Generated on the fly so no table setup is needed.
+        const TOTAL_ROWS: u64 = 1_024_000;
+        const FETCH_SIZE: u32 = 4_000;
+        let sql = "SELECT ROWNUM AS n FROM \
+                   (SELECT LEVEL FROM DUAL CONNECT BY LEVEL <= 1000), \
+                   (SELECT LEVEL FROM DUAL CONNECT BY LEVEL <= 1024)";
+
+        let conn = connect().await.expect("Failed to connect");
+
+        let mut result = conn.query(sql, &[]).await.expect("Query failed");
+        assert_eq!(result.column_count(), 1);
+        let columns = result.columns.clone();
+        let cursor_id = result.cursor_id;
+
+        // Each round returns at least the initial prefetch size (100), so a
+        // correct driver needs far fewer rounds than this; hitting the cap
+        // means has_more_rows never cleared.
+        let max_rounds = TOTAL_ROWS / 100 + 64;
+        let mut rounds: u64 = 0;
+        let mut next_expected: u64 = 1;
+
+        loop {
+            for row in &result.rows {
+                let n = match row.get(0) {
+                    Some(Value::String(s)) => s.parse::<u64>().unwrap_or_else(|_| {
+                        panic!("Row {}: non-numeric value {:?}", next_expected, s)
+                    }),
+                    Some(v) => v.as_i64().unwrap_or_else(|| {
+                        panic!("Row {}: unexpected value {:?}", next_expected, v)
+                    }) as u64,
+                    None => panic!("Row {}: missing value", next_expected),
+                };
+                assert_eq!(
+                    n, next_expected,
+                    "Rows out of sequence after {} rows: expected {}, got {} (dropped or duplicated rows)",
+                    next_expected - 1, next_expected, n
+                );
+                next_expected += 1;
+            }
+
+            if !result.has_more_rows {
+                break;
+            }
+            rounds += 1;
+            assert!(
+                rounds <= max_rounds,
+                "has_more_rows never cleared after {} fetch rounds ({} rows received)",
+                rounds,
+                next_expected - 1
+            );
+            result = conn
+                .fetch_more(cursor_id, &columns, FETCH_SIZE)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "fetch_more failed after {} rows: {:?}",
+                        next_expected - 1,
+                        e
+                    )
+                });
+        }
+
+        assert_eq!(
+            next_expected - 1,
+            TOTAL_ROWS,
+            "Expected {} rows, got {}",
+            TOTAL_ROWS,
+            next_expected - 1
+        );
+
         conn.close().await.expect("Failed to close");
     }
 }

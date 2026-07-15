@@ -42,7 +42,6 @@ cbc = "0.1"
 md-5 = "0.10"
 rand = "0.8"
 pbkdf2 = "0.12"
-hmac = "0.12"
 hex = "0.4"
 
 # System info (for authentication session data)
@@ -53,7 +52,6 @@ chrono = "0.4"
 async-trait = "0.1"
 
 # JSON support
-serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # TLS support
@@ -61,7 +59,6 @@ tokio-rustls = "0.26"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 rustls-pemfile = "2"
 webpki-roots = "0.26"
-rustls-pki-types = "1"
 
 # Encrypted PEM/PKCS#8 key support (for Oracle wallet)
 pkcs8 = { version = "0.10", features = ["encryption", "pem"] }
@@ -71,7 +68,6 @@ indexmap = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
-tokio-test = "0.4"
 
 [[test]]
 name = "packet_tests"

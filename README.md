@@ -362,8 +362,11 @@ The following features are planned but not yet available:
 
 ## Minimum Oracle Version
 
-Oracle Database 12c Release 1 (12.1) or later. Some features require newer versions:
+Oracle Database 11g Release 2 (11.2) or later. Some features require newer versions:
 
+- **Implicit results (`DBMS_SQL.RETURN_RESULT`)**: Oracle 12c
+- **Extended VARCHAR2/RAW sizes above 4000 bytes**: Oracle 12c with extended string size enabled
+- **Array DML row counts**: Oracle 12c
 - **Native BOOLEAN**: Oracle 23c (emulated on earlier versions)
 - **JSON type**: Oracle 21c (use CLOB with JSON on earlier versions)
 - **VECTOR type**: Oracle 23ai

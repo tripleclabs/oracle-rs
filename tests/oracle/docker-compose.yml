@@ -1,6 +1,7 @@
 services:
   oracle:
-    image: gvenzl/oracle-free:slim
+    image: gvenzl/oracle-xe:11-slim
+    platform: linux/amd64
     container_name: oracle-rs-test
     ports:
       - "1521:1521"
@@ -9,7 +10,25 @@ services:
       APP_USER: testuser
       APP_USER_PASSWORD: testpass
     volumes:
-      - ./init:/docker-entrypoint-initdb.d
+      - ./init:/container-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 90s
+
+  oracle23:
+    image: gvenzl/oracle-free:slim
+    container_name: oracle-rs-test-23ai
+    ports:
+      - "1522:1521"
+    environment:
+      ORACLE_PASSWORD: oracle_rs_test
+      APP_USER: testuser
+      APP_USER_PASSWORD: testpass
+    volumes:
+      - ./init:/container-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "healthcheck.sh"]
       interval: 10s

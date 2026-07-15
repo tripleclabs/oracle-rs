@@ -3,10 +3,10 @@
 //! These tests verify the Connection API structure and behavior.
 //! Note: These are unit/API tests that don't require a real Oracle database.
 
+use oracle_rs::constants::OracleType;
 use oracle_rs::{
     ColumnInfo, Config, ConnectionState, Error, QueryOptions, QueryResult, Row, ServerInfo, Value,
 };
-use oracle_rs::constants::OracleType;
 
 mod config_tests {
     use super::*;

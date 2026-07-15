@@ -192,8 +192,11 @@
 //!
 //! ## Minimum Oracle Version
 //!
-//! Oracle Database 12c Release 1 (12.1) or later. Some features require newer versions:
+//! Oracle Database 11g Release 2 (11.2) or later. Some features require newer versions:
 //!
+//! - **Implicit results (`DBMS_SQL.RETURN_RESULT`)**: Oracle 12c
+//! - **Extended VARCHAR2/RAW sizes above 4000 bytes**: Oracle 12c with extended string size enabled
+//! - **Array DML row counts**: Oracle 12c
 //! - **Native BOOLEAN**: Oracle 23c (emulated on earlier versions)
 //! - **JSON type**: Oracle 21c
 //! - **VECTOR type**: Oracle 23ai
@@ -222,21 +225,23 @@ pub mod types;
 pub use batch::{BatchBinds, BatchBuilder, BatchError, BatchOptions, BatchResult};
 pub use capabilities::Capabilities;
 pub use config::{Config, TlsMode};
-pub use connection::{Connection, ConnectionState, PlsqlResult, QueryOptions, QueryResult, ServerInfo};
-pub use transport::{Protocol, TlsConfig};
+pub use connection::{
+    Connection, ConnectionState, PlsqlResult, QueryOptions, QueryResult, ServerInfo,
+};
 pub use constants::FetchOrientation;
-pub use cursor::{ScrollableCursor, ScrollableCursorOptions, ScrollMode, ScrollResult};
+pub use constants::{BindDirection, OracleType};
+pub use cursor::{ScrollMode, ScrollResult, ScrollableCursor, ScrollableCursorOptions};
 pub use dbobject::{CollectionType, DbObject, DbObjectAttr, DbObjectType};
 pub use drcp::{DrcpOptions, DrcpSession, ReleaseMode, SessionPurity};
 pub use error::{Error, Result};
 pub use implicit::{ImplicitResult, ImplicitResults};
-pub use row::{Row, Value, RowDataDecoder};
-pub use statement::{Statement, StatementType, ColumnInfo, BindInfo, BindParam};
+pub use row::{Row, RowDataDecoder, Value};
+pub use statement::{BindInfo, BindParam, ColumnInfo, Statement, StatementType};
 pub use statement_cache::StatementCache;
-pub use constants::{BindDirection, OracleType};
+pub use transport::{Protocol, TlsConfig};
 pub use types::{
-    LobData, LobLocator, LobValue, OracleVector, OsonDecoder, OsonEncoder, RefCursor,
-    SparseVector, VectorData, VectorFormat,
+    LobData, LobLocator, LobValue, OracleVector, OsonDecoder, OsonEncoder, RefCursor, SparseVector,
+    VectorData, VectorFormat,
 };
 
 // Re-export serde_json for users working with JSON columns

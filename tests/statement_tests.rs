@@ -3,9 +3,7 @@
 //! These tests verify the statement parsing, execute message building,
 //! describe info parsing, and fetch message building.
 
-use oracle_rs::constants::{
-    FunctionCode, MessageType, OracleType, PacketType, PACKET_HEADER_SIZE,
-};
+use oracle_rs::constants::{FunctionCode, MessageType, OracleType, PacketType, PACKET_HEADER_SIZE};
 use oracle_rs::messages::{ExecuteMessage, ExecuteOptions, FetchMessage};
 use oracle_rs::statement::{BindInfo, ColumnInfo, Statement, StatementType};
 use oracle_rs::Capabilities;
@@ -361,7 +359,10 @@ mod oracle_type_tests {
         assert_eq!(OracleType::try_from(2u8).unwrap(), OracleType::Number);
         assert_eq!(OracleType::try_from(12u8).unwrap(), OracleType::Date);
         assert_eq!(OracleType::try_from(96u8).unwrap(), OracleType::Char);
-        assert_eq!(OracleType::try_from(100u8).unwrap(), OracleType::BinaryFloat);
+        assert_eq!(
+            OracleType::try_from(100u8).unwrap(),
+            OracleType::BinaryFloat
+        );
         assert_eq!(
             OracleType::try_from(101u8).unwrap(),
             OracleType::BinaryDouble

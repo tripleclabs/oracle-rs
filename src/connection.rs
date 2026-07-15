@@ -26,28 +26,35 @@
 //! }
 //! ```
 
+use bytes::Bytes;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
-use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
 use crate::batch::{BatchBinds, BatchResult};
 use crate::buffer::{ReadBuffer, WriteBuffer};
-use crate::transport::{TlsConfig, TlsOracleStream, connect_tls};
 use crate::capabilities::Capabilities;
 use crate::config::{Config, ServiceMethod};
-use crate::constants::{BindDirection, FetchOrientation, FunctionCode, MessageType, OracleType, PacketType, PACKET_HEADER_SIZE};
-use crate::cursor::{ScrollableCursor, ScrollResult};
+use crate::constants::{
+    version, BindDirection, FetchOrientation, FunctionCode, MessageType, OracleType, PacketType,
+    PACKET_HEADER_SIZE,
+};
+use crate::cursor::{ScrollResult, ScrollableCursor};
 use crate::error::{Error, Result};
 use crate::implicit::{ImplicitResult, ImplicitResults};
-use crate::messages::{AcceptMessage, AuthMessage, AuthPhase, ConnectMessage, ExecuteMessage, ExecuteOptions, FetchMessage, LobOpMessage};
+use crate::messages::{
+    AcceptMessage, AuthMessage, AuthPhase, ConnectMessage, ExecuteMessage, ExecuteOptions,
+    FetchMessage, LobOpMessage,
+};
 use crate::packet::Packet;
 use crate::row::{Row, Value};
 use crate::statement::{BindParam, ColumnInfo, Statement, StatementType};
-use crate::types::{LobData, LobLocator, LobValue};
 use crate::statement_cache::StatementCache;
+use crate::transport::{connect_tls, TlsConfig, TlsOracleStream};
+use crate::types::{LobData, LobLocator, LobValue};
 
 /// Connection state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,12 +138,16 @@ impl QueryResult {
 
     /// Get a column by name
     pub fn column_by_name(&self, name: &str) -> Option<&ColumnInfo> {
-        self.columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))
+        self.columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(name))
     }
 
     /// Get column index by name
     pub fn column_index(&self, name: &str) -> Option<usize> {
-        self.columns.iter().position(|c| c.name.eq_ignore_ascii_case(name))
+        self.columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(name))
     }
 
     /// Iterate over rows
@@ -237,7 +248,7 @@ enum OracleStream {
     /// Plain TCP connection
     Plain(TcpStream),
     /// TLS-encrypted connection
-    Tls(TlsOracleStream),
+    Tls(Box<TlsOracleStream>),
 }
 
 impl OracleStream {
@@ -267,7 +278,6 @@ impl OracleStream {
             OracleStream::Tls(stream) => stream.flush().await,
         }
     }
-
 }
 
 /// Internal connection state shared across async operations
@@ -282,6 +292,9 @@ struct ConnectionInner {
     sequence_number: u8,
     /// Statement cache for prepared statement reuse
     statement_cache: Option<StatementCache>,
+    /// Last parsed row per cursor, used to resolve duplicate-column bit vectors
+    /// across fetch batch boundaries.
+    fetch_seed_rows: HashMap<u16, Vec<Value>>,
 }
 
 impl ConnectionInner {
@@ -299,6 +312,7 @@ impl ConnectionInner {
             } else {
                 None
             },
+            fetch_seed_rows: HashMap::new(),
         }
     }
 
@@ -426,13 +440,155 @@ impl ConnectionInner {
     ///
     /// Returns the combined payload of all packets (excluding headers).
     async fn receive_response(&mut self) -> Result<bytes::Bytes> {
+        self.receive_response_with_lob_parameter_len(None).await
+    }
+
+    async fn receive_lob_response(
+        &mut self,
+        lob_parameter_body_len: usize,
+    ) -> Result<bytes::Bytes> {
+        self.receive_response_with_lob_parameter_len(Some(lob_parameter_body_len))
+            .await
+    }
+
+    async fn receive_response_with_lob_parameter_len(
+        &mut self,
+        lob_parameter_body_len: Option<usize>,
+    ) -> Result<bytes::Bytes> {
         use crate::constants::{data_flags, MessageType};
+
+        let legacy_11g = self.server_info.protocol_version <= version::MIN_ACCEPTED;
+        let is_lob = lob_parameter_body_len.is_some();
+        // Hoisted once instead of re-reading the environment on every packet.
+        let debug = std::env::var_os("ORACLE_RS_DEBUG_QUERY").is_some();
+
+        // Fast path: modern protocol (> 314), non-LOB response.
+        //
+        // Before Oracle 11g support was added, query/fetch/cursor/define
+        // responses were read with a single receive(): modern servers negotiate
+        // a large SDU and deliver each describe/prefetch/fetch batch in one TNS
+        // data packet, so no accumulation is required. Crucially, servers below
+        // TTC 23.4 (protocols 315-318, i.e. 12c-19c) do NOT set the
+        // END_OF_RESPONSE data flag, and row/describe streams carry no in-band
+        // terminator that the inspector below can recognise. An accumulation
+        // loop therefore has no reliable stop condition for these responses and
+        // would block forever on a complete response whose final packet happens
+        // to fill the SDU exactly. Restoring the single-receive semantics for
+        // modern protocols avoids that hang and matches long-standing behaviour;
+        // the callers already handle MARKER packets and short responses.
+        //
+        // When the server DOES set the END_OF_RESPONSE data flag (protocol
+        // 319+, negotiated via supports_end_of_response), that flag is a
+        // deterministic terminator: accumulate DATA packets until it appears
+        // so responses larger than one SDU (e.g. big fetch batches) are not
+        // silently truncated at the first packet boundary.
+        if !legacy_11g && !is_lob {
+            if !self.capabilities.supports_end_of_response {
+                return self.receive().await;
+            }
+
+            let mut accumulated = Vec::new();
+            loop {
+                let packet = self.receive().await?;
+                if packet.len() < PACKET_HEADER_SIZE {
+                    return Err(Error::Protocol("Packet too small".to_string()));
+                }
+                // Non-DATA packet (e.g., MARKER) - return as-is for special
+                // handling by the caller.
+                if packet[4] != PacketType::Data as u8 {
+                    return Ok(packet);
+                }
+                let payload = &packet[PACKET_HEADER_SIZE..];
+                if payload.len() < 2 {
+                    return Err(Error::Protocol("DATA packet payload too small".to_string()));
+                }
+                let data_flags_value = u16::from_be_bytes([payload[0], payload[1]]);
+                if accumulated.is_empty() {
+                    accumulated.extend_from_slice(payload);
+                } else {
+                    // Subsequent packets: skip the per-packet data flags
+                    accumulated.extend_from_slice(&payload[2..]);
+                }
+                if debug {
+                    eprintln!(
+                        "oracle-rs receive_response: packet {} bytes, accumulated {} bytes, \
+                         data_flags={:#06x}",
+                        packet.len(),
+                        accumulated.len(),
+                        data_flags_value,
+                    );
+                }
+                if (data_flags_value & (data_flags::END_OF_RESPONSE | data_flags::EOF)) != 0 {
+                    break;
+                }
+            }
+
+            let total_len = PACKET_HEADER_SIZE + accumulated.len();
+            let mut result = Vec::with_capacity(total_len);
+            if self.large_sdu {
+                result.extend_from_slice(&(total_len as u32).to_be_bytes());
+            } else {
+                result.extend_from_slice(&(total_len as u16).to_be_bytes());
+                result.extend_from_slice(&[0, 0]); // Checksum
+            }
+            result.push(PacketType::Data as u8);
+            result.push(0); // Flags
+            result.extend_from_slice(&[0, 0]); // Header checksum
+            result.extend_from_slice(&accumulated);
+            return Ok(bytes::Bytes::from(result));
+        }
 
         let mut accumulated_payload = Vec::new();
         let mut is_first_packet = true;
+        let idle_timeout = std::time::Duration::from_secs(2);
+        // Byte offset (into accumulated_payload[2..]) up to which the message
+        // stream has already been fully parsed as complete messages, plus the
+        // running saw_lob_data flag. These let the inspector resume from the
+        // frontier each packet instead of re-scanning the whole payload (which
+        // was O(N^2) for multi-packet LOB reads).
+        let mut scan_offset = 0usize;
+        let mut saw_lob_data = false;
+        // True once the inspector has proven the stream ends mid-message and we
+        // must keep reading to complete it.
+        let mut incomplete = false;
 
         loop {
-            let packet = self.receive().await?;
+            // Choosing how to wait for the next packet:
+            //
+            // * When the stream is known to be mid-message (`incomplete`), we
+            //   MUST block until the rest arrives. Turning slowness into an
+            //   error here would discard valid accumulated data and desync the
+            //   connection (the previous code raised a fatal 2s ConnectionTimeout
+            //   in this situation). Blocking on genuinely incomplete data is the
+            //   correct behaviour.
+            // * On 11g (protocol 314) the server never sets END_OF_RESPONSE, so
+            //   for responses this generic loop cannot parse to completion an
+            //   idle timeout is used ONLY as a soft "no more packets are coming"
+            //   signal. Its expiry is treated as end-of-response (break and
+            //   return the data accumulated so far), never as an error. Row
+            //   fetch responses no longer come through here at all: they use
+            //   receive_fetch_response(), which has column metadata and
+            //   terminates deterministically on the terminal Error/Status
+            //   message instead of on silence. This loop remains for the
+            //   responses without such context (initial execute/describe, DML,
+            //   LOB operations), which fit in a single packet in practice.
+            let packet = if !incomplete && legacy_11g && !is_first_packet {
+                match tokio::time::timeout(idle_timeout, self.receive()).await {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        if debug {
+                            eprintln!(
+                                "oracle-rs receive_response: 11g idle timeout, treating \
+                                 {} accumulated bytes as complete response",
+                                accumulated_payload.len()
+                            );
+                        }
+                        break;
+                    }
+                }
+            } else {
+                self.receive().await?
+            };
 
             if packet.len() < PACKET_HEADER_SIZE {
                 return Err(Error::Protocol("Packet too small".to_string()));
@@ -460,35 +616,90 @@ impl ConnectionInner {
             let has_eof_flag = (data_flags_value & data_flags::EOF) != 0;
 
             // Also check for EndOfResponse message type (header + 3 bytes with msg type 29)
-            let has_end_message = payload.len() == 3
-                && payload[2] == MessageType::EndOfResponse as u8;
+            let has_end_message =
+                payload.len() == 3 && payload[2] == MessageType::EndOfResponse as u8;
 
             // Accumulate payload first
             if is_first_packet {
-                // First packet: include data flags in accumulated payload
                 accumulated_payload.extend_from_slice(payload);
                 is_first_packet = false;
             } else {
-                // Subsequent packets: skip the data flags, append only the message data
+                // Subsequent packets: skip the data flags
                 accumulated_payload.extend_from_slice(&payload[2..]);
             }
 
             // Check for end of response using data flags from this packet
             let is_end_of_response = has_end_flag || has_eof_flag || has_end_message;
 
-            // If data flags don't indicate end, scan the ACCUMULATED message data
-            // for terminal messages. We scan accumulated data (not just current packet)
-            // because messages can span packet boundaries.
-            let has_terminal_message = if !is_end_of_response && accumulated_payload.len() > 2 {
-                self.scan_for_terminal_message(&accumulated_payload[2..])
-            } else {
-                false
-            };
+            // Inspect the accumulated message data for either a terminal
+            // message or a message that is clearly still split across packets.
+            // The scan resumes from the previously parsed frontier so repeated
+            // calls stay linear in the total payload size.
+            let (has_terminal_message, has_incomplete_message) =
+                if !is_end_of_response && accumulated_payload.len() > 2 {
+                    self.inspect_message_stream_resumable(
+                        &accumulated_payload[2..],
+                        lob_parameter_body_len,
+                        &mut scan_offset,
+                        &mut saw_lob_data,
+                    )
+                } else {
+                    (false, false)
+                };
 
-            // Check if this is the last packet
+            // A packet smaller than the SDU often indicates the server has no
+            // more data to send. Oracle 11g fills data packets to slightly
+            // below the negotiated SDU (observed 8155 bytes against an SDU of
+            // 8192), so "full" is detected with slack rather than equality;
+            // multi-packet responses (large fetch batches, LOB chunks) would
+            // otherwise be truncated at the first packet. A response whose
+            // final packet lands inside the slack window is still terminated
+            // correctly, by the idle timeout instead of this heuristic.
+            let short_packet_slack = if legacy_11g { 64 } else { 1 };
+            let is_short_packet = (packet.len() + short_packet_slack) < self.sdu_size as usize;
+
+            if debug {
+                eprintln!(
+                    "oracle-rs receive_response: packet {} bytes, accumulated {} bytes, \
+                     end_flag={} eof_flag={} end_msg={} terminal={} incomplete={} \
+                     short={} (sdu={})",
+                    packet.len(),
+                    accumulated_payload.len(),
+                    has_end_flag,
+                    has_eof_flag,
+                    has_end_message,
+                    has_terminal_message,
+                    has_incomplete_message,
+                    is_short_packet,
+                    self.sdu_size,
+                );
+            }
+
+            // Deterministic completion signals first.
             if is_end_of_response || has_terminal_message {
                 break;
             }
+            // Stream proven to end mid-message: keep reading, and never apply the
+            // short-packet heuristic (which would truncate a split message).
+            if has_incomplete_message {
+                incomplete = true;
+                continue;
+            }
+            incomplete = false;
+            // Heuristic completion. On 11g a short final packet is the usual
+            // signal that the batch is done; the follow-up parse tolerates this
+            // because 11g fetches rows in explicit batches via fetch_more() (with
+            // prefetch_rows=0), so any residual/short packet is re-driven by the
+            // next fetch rather than silently lost. For modern LOB reads the SDU
+            // is large so is_short_packet effectively never fires here and
+            // completion is driven by flags/terminal messages, matching the
+            // pre-existing single-response behaviour.
+            if is_short_packet {
+                break;
+            }
+            // Full-SDU packet, no terminator, stream not flagged incomplete: on
+            // 11g loop and let the idle timeout confirm end-of-response; on other
+            // paths keep reading for the deferred terminal/flag.
         }
 
         // Build a synthetic packet with combined payload
@@ -512,87 +723,136 @@ impl ConnectionInner {
         Ok(bytes::Bytes::from(result))
     }
 
-    /// Scan message data for terminal message types (ERROR or END_OF_RESPONSE)
-    /// that indicate the response is complete.
+    /// Inspect message data for terminal message types and incomplete LOB
+    /// chunks. The return value is (has_terminal_message, has_incomplete_message).
     ///
-    /// This is needed because Oracle doesn't always set the END_OF_RESPONSE flag
-    /// in the data flags for LOB operations. Instead, we must detect the terminal
-    /// message by parsing the message stream.
+    /// Thin non-resumable wrapper retained for unit tests; the receive loop
+    /// calls [`Self::inspect_message_stream_resumable`] directly.
+    #[cfg(test)]
+    fn inspect_message_stream(&self, data: &[u8]) -> (bool, bool) {
+        self.inspect_message_stream_with_lob_parameter_len(data, None)
+    }
+
+    #[cfg(test)]
+    fn inspect_message_stream_with_lob_parameter_len(
+        &self,
+        data: &[u8],
+        lob_parameter_body_len: Option<usize>,
+    ) -> (bool, bool) {
+        let mut offset = 0usize;
+        let mut saw_lob_data = false;
+        self.inspect_message_stream_resumable(
+            data,
+            lob_parameter_body_len,
+            &mut offset,
+            &mut saw_lob_data,
+        )
+    }
+
+    /// Resumable variant of the message-stream inspector.
     ///
-    /// NOTE: This is conservative - it only returns true if we can definitively
-    /// identify a terminal message. We avoid false positives by not scanning
-    /// raw byte values (which could match message type values by coincidence).
-    fn scan_for_terminal_message(&self, data: &[u8]) -> bool {
+    /// `offset` is the byte position within `data` from which to resume scanning;
+    /// on return it is advanced to the end of the last fully-parsed complete
+    /// message so the next call (after more packets have been appended to `data`)
+    /// only scans the newly-arrived bytes. `saw_lob_data` carries the "we have
+    /// already seen LOB data" state across resumes, which matters for correctly
+    /// classifying the trailing PARAMETER message of a LOB response.
+    ///
+    /// Bytes before `offset` are never rewound: they contain only complete,
+    /// already-classified non-terminal messages (terminal messages and
+    /// incomplete tails always cause an early return without advancing past
+    /// them), so resuming from the frontier is equivalent to a full re-scan but
+    /// runs in linear rather than quadratic total time.
+    fn inspect_message_stream_resumable(
+        &self,
+        data: &[u8],
+        lob_parameter_body_len: Option<usize>,
+        offset: &mut usize,
+        saw_lob_data: &mut bool,
+    ) -> (bool, bool) {
         use crate::buffer::ReadBuffer;
-        use crate::constants::MessageType;
 
-        if data.is_empty() {
-            return false;
-        }
-
-        // Try to parse the message stream and look for ERROR or END_OF_RESPONSE
-        let mut buf = ReadBuffer::from_slice(data);
+        let base = (*offset).min(data.len());
+        let mut buf = ReadBuffer::from_slice(&data[base..]);
 
         while buf.remaining() > 0 {
             let msg_type = match buf.read_u8() {
                 Ok(t) => t,
-                Err(_) => return false, // Can't read, assume incomplete
+                Err(_) => return (false, true),
             };
 
-            // END_OF_RESPONSE is a standalone message with no additional data
-            if msg_type == MessageType::EndOfResponse as u8 {
-                return true;
+            if msg_type == MessageType::EndOfResponse as u8
+                || msg_type == MessageType::Error as u8
+                || msg_type == MessageType::Status as u8
+            {
+                return (true, false);
             }
 
-            // ERROR message indicates end of response for older Oracle
-            if msg_type == MessageType::Error as u8 {
-                // Error message found - this indicates end of response
-                return true;
+            if msg_type == MessageType::Parameter as u8 && *saw_lob_data {
+                if let Some(body_len) = lob_parameter_body_len {
+                    match buf.skip(body_len) {
+                        Ok(_) => return (false, false),
+                        Err(Error::BufferUnderflow { .. }) => return (false, true),
+                        Err(_) => return (false, false),
+                    }
+                } else {
+                    return (false, false);
+                }
             }
 
-            // STATUS message also indicates end of response
-            if msg_type == MessageType::Status as u8 {
-                return true;
-            }
-
-            // LOB_DATA message - skip the data
             if msg_type == MessageType::LobData as u8 {
-                // Read length-prefixed data and skip it
-                match buf.read_raw_bytes_chunked() {
-                    Ok(_) => continue,
-                    Err(_) => return false, // Incomplete LOB data, need more packets
-                }
-            }
-
-            // PARAMETER message (8) - this contains the updated locator and amount.
-            // For LOB write responses, PARAMETER is the first message and the response
-            // is relatively small (locator + error info). We can safely scan for
-            // ERROR/END_OF_RESPONSE bytes because the locator doesn't contain arbitrary
-            // binary data that would false-positive.
-            //
-            // For LOB read responses, LobData comes first and contains the actual data,
-            // which might contain bytes that match ERROR (4) or END_OF_RESPONSE (29).
-            // But since we skip LobData content, by the time we reach PARAMETER,
-            // the remaining data is just locator + error info.
-            if msg_type == MessageType::Parameter as u8 {
-                let remaining = buf.remaining_bytes();
-                // Check if ERROR (4) or END_OF_RESPONSE (29) appears in remaining bytes
-                // This is safe because PARAMETER data (locator + amount) doesn't contain
-                // arbitrary binary data that would false-positive.
-                if remaining.contains(&(MessageType::Error as u8))
-                    || remaining.contains(&(MessageType::EndOfResponse as u8))
+                *saw_lob_data = true;
+                let lob_data_result = if self.server_info.protocol_version <= version::MIN_ACCEPTED
                 {
-                    return true;
-                }
-                // If no terminal marker found, response might be incomplete
-                return false;
-            }
+                    Self::skip_legacy_11g_lob_data(&mut buf)
+                } else {
+                    buf.skip_raw_bytes_chunked()
+                };
 
-            // For other unknown message types, we can't determine the end
-            return false;
+                match lob_data_result {
+                    Ok(_) => {
+                        // This LOB chunk was fully consumed; advance the resume
+                        // frontier so the next call does not re-skip it.
+                        *offset = base + buf.position();
+                        continue;
+                    }
+                    Err(Error::BufferUnderflow { .. } | Error::InvalidLengthIndicator(_)) => {
+                        return (false, true);
+                    }
+                    Err(_) => return (false, false),
+                }
+            } else {
+                if *saw_lob_data {
+                    return (false, true);
+                }
+                return (false, false);
+            }
         }
 
-        false
+        if *saw_lob_data {
+            return (false, true);
+        }
+
+        (false, false)
+    }
+
+    fn skip_legacy_11g_lob_data(buf: &mut ReadBuffer) -> Result<()> {
+        use crate::constants::length;
+
+        let length = buf.read_u8()?;
+        if length != length::LONG_INDICATOR {
+            return buf.skip(length as usize);
+        }
+
+        loop {
+            let chunk_len = buf.read_u8()? as usize;
+            if chunk_len == 0 {
+                break;
+            }
+            buf.skip(chunk_len)?;
+        }
+
+        Ok(())
     }
 
     /// Send a marker packet with the specified marker type
@@ -735,6 +995,35 @@ pub struct Connection {
 // Connection ID counter
 static CONNECTION_ID_COUNTER: AtomicU32 = AtomicU32::new(1);
 
+/// Outcome of the check-only scan over an accumulated fetch response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FetchScanOutcome {
+    /// The terminal Error/Status message has been fully received; the
+    /// response is complete.
+    Terminal,
+    /// The stream ends mid-message (or the terminal message has not arrived
+    /// yet); more packets must be read.
+    NeedMore,
+    /// A message type the scanner cannot classify; fall back to heuristic
+    /// termination for the rest of the response.
+    Unknown,
+}
+
+/// Resumable state for [`Connection::scan_fetch_message_stream`].
+///
+/// `scan_offset` is the frontier (into the payload after the leading data
+/// flags) up to which messages have been fully parsed; it only advances past
+/// complete messages, so each scan re-examines at most one partially-received
+/// message plus newly arrived bytes. `bit_vector` mirrors the running
+/// duplicate-column bit vector exactly as `parse_fetch_response` tracks it,
+/// because it determines how many column values the next RowData message
+/// consumes from the buffer.
+#[derive(Debug, Default)]
+struct FetchScanState {
+    scan_offset: usize,
+    bit_vector: Option<Vec<u8>>,
+}
+
 impl Connection {
     /// Create a new connection to an Oracle database
     ///
@@ -786,12 +1075,14 @@ impl Connection {
 
         // Wrap with TLS if configured
         let stream = if config.is_tls_enabled() {
-            let tls_config = config.tls_config.as_ref()
+            let tls_config = config
+                .tls_config
+                .as_ref()
                 .cloned()
                 .unwrap_or_else(TlsConfig::new);
 
             let tls_stream = connect_tls(tcp_stream, &config.host, &tls_config).await?;
-            OracleStream::Tls(tls_stream)
+            OracleStream::Tls(Box::new(tls_stream))
         } else {
             OracleStream::Plain(tcp_stream)
         };
@@ -839,6 +1130,69 @@ impl Connection {
             }
         }
         result
+    }
+
+    /// Record the BitVector duplicate-column decompression seed (the last row
+    /// values seen) for a cursor, so the first row of the next fetch batch can
+    /// be reconstructed against it.
+    ///
+    /// `is_initial` must be true when this is called for a fresh (re-)execute
+    /// and false for a fetch continuation. On a fresh execute that returns no
+    /// prefetched rows, any seed left over from a previous execution of the
+    /// same (reused) cursor id must be dropped: the next fetch starts at the
+    /// first row of a brand new result set and has no previous-row seed.
+    /// Leaving a continuation's stale seed in place there is only safe because a
+    /// continuation that reports more rows but returns none has not advanced.
+    async fn update_fetch_seed_row(
+        &self,
+        cursor_id: u16,
+        rows: &[Row],
+        has_more_rows: bool,
+        is_initial: bool,
+    ) {
+        if cursor_id == 0 {
+            return;
+        }
+        let mut inner = self.inner.lock().await;
+        if has_more_rows {
+            if let Some(last_row) = rows.last() {
+                inner
+                    .fetch_seed_rows
+                    .insert(cursor_id, last_row.values().to_vec());
+            } else if is_initial {
+                inner.fetch_seed_rows.remove(&cursor_id);
+            }
+        } else {
+            inner.fetch_seed_rows.remove(&cursor_id);
+        }
+    }
+
+    async fn fetch_initial_11g_query_rows(&self, query_result: &mut QueryResult) -> Result<()> {
+        let protocol_version = {
+            let inner = self.inner.lock().await;
+            inner.server_info.protocol_version
+        };
+
+        if protocol_version > version::MIN_ACCEPTED
+            || !query_result.rows.is_empty()
+            || !query_result.has_more_rows
+            || query_result.cursor_id == 0
+        {
+            return Ok(());
+        }
+
+        let fetch_size = std::env::var("ORACLE_RS_QUERY_FETCH_ROWS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(100);
+        let mut fetched_result = self
+            .fetch_more(query_result.cursor_id, &query_result.columns, fetch_size)
+            .await?;
+        if fetched_result.columns.is_empty() {
+            fetched_result.columns = query_result.columns.clone();
+        }
+        *query_result = fetched_result;
+        Ok(())
     }
 
     /// Get server information
@@ -967,6 +1321,11 @@ impl Connection {
                     inner.server_info.protocol_version = accept.protocol_version;
                     inner.server_info.supports_oob = accept.supports_oob;
                     inner.sdu_size = accept.sdu.min(65535) as u16;
+                    inner.capabilities.adjust_for_protocol(
+                        accept.protocol_version,
+                        accept.service_options,
+                        accept.flags2,
+                    );
 
                     inner.state = ConnectionState::Connected;
                     return Ok(());
@@ -1018,18 +1377,38 @@ impl Connection {
         let mut inner = self.inner.lock().await;
         let large_sdu = inner.large_sdu;
 
+        // The ACCEPT packet is the authoritative source for the negotiated
+        // TTC version. Keep capabilities in sync so the 11g-specific protocol
+        // builder is actually selected for TNS 314 sessions.
+        inner.capabilities.protocol_version = inner.server_info.protocol_version;
 
         // Build protocol request (includes header)
         let protocol_msg = ProtocolMessage::new();
-        let packet = protocol_msg.build_request(large_sdu)?;
+        let packet = protocol_msg.build_request(&inner.capabilities, large_sdu)?;
+        if std::env::var_os("ORACLE_RS_DEBUG_HANDSHAKE").is_some() {
+            eprintln!(
+                "oracle-rs protocol request ({} bytes): {}",
+                packet.len(),
+                hex::encode(packet.as_ref())
+            );
+        }
         inner.send(&packet).await?;
 
         // Receive response
         let response = inner.receive().await?;
+        if std::env::var_os("ORACLE_RS_DEBUG_HANDSHAKE").is_some() {
+            eprintln!(
+                "oracle-rs protocol response ({} bytes): {}",
+                response.len(),
+                hex::encode(response.as_ref())
+            );
+        }
 
         // Validate packet type (at offset 4 for both SDU modes)
         if response.len() <= 4 || response[4] != PacketType::Data as u8 {
-            return Err(Error::ProtocolError("Protocol negotiation failed".to_string()));
+            return Err(Error::ProtocolError(
+                "Protocol negotiation failed".to_string(),
+            ));
         }
 
         // Parse the Protocol response to extract server capabilities
@@ -1037,6 +1416,13 @@ impl Connection {
         let payload = &response[PACKET_HEADER_SIZE..];
         let mut protocol_msg = ProtocolMessage::new();
         protocol_msg.parse_response(payload, &mut inner.capabilities)?;
+
+        if std::env::var_os("ORACLE_RS_DEBUG_HANDSHAKE").is_some() {
+            eprintln!(
+                "oracle-rs ttc_field_version={} protocol_version={}",
+                inner.capabilities.ttc_field_version, inner.capabilities.protocol_version,
+            );
+        }
 
         // Update server info with banner
         if let Some(banner) = &protocol_msg.server_banner {
@@ -1054,27 +1440,53 @@ impl Connection {
         let mut inner = self.inner.lock().await;
         let large_sdu = inner.large_sdu;
 
+        // The legacy 11g data-types payload is keyed off the negotiated TNS
+        // protocol version, so mirror the ACCEPT value here as well.
+        inner.capabilities.protocol_version = inner.server_info.protocol_version;
 
         // Build data types request using DataTypesMessage (includes all ~320 data types)
         let data_types_msg = DataTypesMessage::new();
         let packet = data_types_msg.build_request(&inner.capabilities, large_sdu)?;
+        if std::env::var_os("ORACLE_RS_DEBUG_HANDSHAKE").is_some() {
+            eprintln!(
+                "oracle-rs data-types request ({} bytes): {}",
+                packet.len(),
+                hex::encode(packet.as_ref())
+            );
+        }
         inner.send(&packet).await?;
 
         // Receive response
         let response = inner.receive().await?;
+        if std::env::var_os("ORACLE_RS_DEBUG_HANDSHAKE").is_some() {
+            eprintln!(
+                "oracle-rs data-types response ({} bytes): {}",
+                response.len(),
+                hex::encode(response.as_ref())
+            );
+        }
 
-        // Basic validation - packet type is at offset 4 regardless of large_sdu
+        // Basic validation - packet type is at offset 4 regardless of large_sdu.
+        //
+        // The server echoes back the negotiated data types. That echo is
+        // advisory: its parsed contents are not consumed anywhere, and the
+        // request is always a single packet (build_request never produces a
+        // continuation). We therefore only confirm this is a DATA packet and
+        // deliberately do not parse the echoed type list, matching the
+        // pre-11g behavior and tolerating server-specific layout differences
+        // (e.g. Oracle 11g) rather than hard-failing connect() on a parse error.
         if response.len() > 4 && response[4] == PacketType::Data as u8 {
             inner.state = ConnectionState::DataTypesNegotiated;
             Ok(())
         } else {
-            Err(Error::ProtocolError("Data types negotiation failed".to_string()))
+            Err(Error::ProtocolError(
+                "Data types negotiation failed".to_string(),
+            ))
         }
     }
 
     /// Perform authentication
     async fn authenticate(&self) -> Result<()> {
-
         let service_name = match &self.config.service {
             ServiceMethod::ServiceName(name) => name.clone(),
             ServiceMethod::Sid(sid) => sid.clone(),
@@ -1085,17 +1497,51 @@ impl Connection {
             self.config.password().as_bytes(),
             &service_name,
         );
+        auth.set_connect_descriptor_info(
+            &self.config.host,
+            self.config.port,
+            matches!(self.config.service, ServiceMethod::Sid(_)),
+        );
 
         // Phase one: send username and session info
         {
             let mut inner = self.inner.lock().await;
             let large_sdu = inner.large_sdu;
             let request = auth.build_request(&inner.capabilities, large_sdu)?;
+            if std::env::var_os("ORACLE_RS_DEBUG_HANDSHAKE").is_some() {
+                eprintln!(
+                    "oracle-rs auth phase1 request ({} bytes): {}",
+                    request.len(),
+                    hex::encode(request.as_ref())
+                );
+            }
             inner.send(&request).await?;
 
             let response = inner.receive().await?;
+            if std::env::var_os("ORACLE_RS_DEBUG_HANDSHAKE").is_some() {
+                eprintln!(
+                    "oracle-rs auth phase1 response ({} bytes): {}",
+                    response.len(),
+                    hex::encode(response.as_ref())
+                );
+            }
             if response.len() <= PACKET_HEADER_SIZE {
                 return Err(Error::Protocol("Empty auth response".to_string()));
+            }
+
+            let packet_type = response[4];
+            if packet_type == PacketType::Marker as u8 {
+                let error_response = inner.handle_marker_reset().await?;
+                if std::env::var_os("ORACLE_RS_DEBUG_HANDSHAKE").is_some() {
+                    eprintln!(
+                        "oracle-rs auth phase1 marker status ({} bytes): {}",
+                        error_response.len(),
+                        hex::encode(error_response.as_ref())
+                    );
+                }
+                let error_text = Self::extract_embedded_server_error(error_response.as_ref())
+                    .unwrap_or_else(|| "server rejected authentication phase one".to_string());
+                return Err(Error::AuthenticationFailed(error_text));
             }
 
             // Check for error message type
@@ -1116,18 +1562,41 @@ impl Connection {
             let mut inner = self.inner.lock().await;
             let large_sdu = inner.large_sdu;
             let request = auth.build_request(&inner.capabilities, large_sdu)?;
+            if std::env::var_os("ORACLE_RS_DEBUG_HANDSHAKE").is_some() {
+                eprintln!(
+                    "oracle-rs auth phase2 request ({} bytes): {}",
+                    request.len(),
+                    hex::encode(request.as_ref())
+                );
+            }
             inner.send(&request).await?;
 
             let response = inner.receive().await?;
+            if std::env::var_os("ORACLE_RS_DEBUG_HANDSHAKE").is_some() {
+                eprintln!(
+                    "oracle-rs auth phase2 response ({} bytes): {}",
+                    response.len(),
+                    hex::encode(response.as_ref())
+                );
+            }
             if response.len() <= PACKET_HEADER_SIZE {
                 return Err(Error::Protocol("Empty auth phase two response".to_string()));
             }
 
             // Check for error message type or marker
             let packet_type = response[4];
-            if packet_type == 12 {
-                // Marker - authentication failed
-                return Err(Error::AuthenticationFailed("Server sent MARKER - authentication rejected".to_string()));
+            if packet_type == PacketType::Marker as u8 {
+                let error_response = inner.handle_marker_reset().await?;
+                if std::env::var_os("ORACLE_RS_DEBUG_HANDSHAKE").is_some() {
+                    eprintln!(
+                        "oracle-rs auth phase2 marker status ({} bytes): {}",
+                        error_response.len(),
+                        hex::encode(error_response.as_ref())
+                    );
+                }
+                let error_text = Self::extract_embedded_server_error(error_response.as_ref())
+                    .unwrap_or_else(|| "server rejected authentication phase two".to_string());
+                return Err(Error::AuthenticationFailed(error_text));
             }
 
             if response.len() > PACKET_HEADER_SIZE + 2 {
@@ -1147,13 +1616,40 @@ impl Connection {
             ));
         }
 
+        let session_identifiers = auth.session_identifiers();
+
         // Store combo key for later use (encrypted data)
         let mut inner = self.inner.lock().await;
         if let Some(combo_key) = auth.combo_key() {
             inner.capabilities.combo_key = Some(combo_key.to_vec());
         }
-        // Auth used sequence numbers 1 and 2, set to 2 so next is 3
+        if let Some((session_id, serial_number, _failover_id)) = session_identifiers {
+            inner.server_info.session_id = session_id;
+            inner.server_info.serial_number = serial_number;
+        }
         inner.sequence_number = 2;
+
+        if inner.server_info.protocol_version <= version::MIN_ACCEPTED {
+            let mut ver_buf = crate::buffer::WriteBuffer::with_capacity(32);
+            ver_buf.write_zeros(PACKET_HEADER_SIZE)?;
+            ver_buf.write_u16_be(0)?;
+            ver_buf.write_u8(MessageType::Function as u8)?;
+            ver_buf.write_u8(FunctionCode::VersionNewFormat as u8)?;
+            ver_buf.write_u8(0)?;
+            ver_buf.write_u8(1)?;
+            ver_buf.write_ub2(0x100)?;
+            ver_buf.write_u8(1)?;
+            ver_buf.write_u8(1)?;
+            let total_len = ver_buf.len() as u32;
+            let header = crate::packet::PacketHeader::new(PacketType::Data, total_len);
+            let mut hdr_buf = crate::buffer::WriteBuffer::with_capacity(PACKET_HEADER_SIZE);
+            header.write(&mut hdr_buf, inner.large_sdu)?;
+            let mut packet = ver_buf.into_inner();
+            packet[..PACKET_HEADER_SIZE].copy_from_slice(hdr_buf.as_slice());
+            inner.send(&packet.freeze()).await?;
+            let _ = inner.receive().await?;
+        }
+
         inner.state = ConnectionState::Ready;
 
         Ok(())
@@ -1192,7 +1688,11 @@ impl Connection {
             let mut inner = self.inner.lock().await;
             if let Some(ref mut cache) = inner.statement_cache {
                 if let Some(cached_stmt) = cache.get(sql) {
-                    tracing::trace!(sql = sql, cursor_id = cached_stmt.cursor_id(), "Using cached statement (execute)");
+                    tracing::trace!(
+                        sql = sql,
+                        cursor_id = cached_stmt.cursor_id(),
+                        "Using cached statement (execute)"
+                    );
                     (cached_stmt, true)
                 } else {
                     (Statement::new(sql), false)
@@ -1202,17 +1702,37 @@ impl Connection {
             }
         };
 
-        let result = match statement.statement_type() {
+        let mut result = match statement.statement_type() {
             StatementType::Query => self.execute_query_with_params(&statement, params).await,
             _ => self.execute_dml_with_params(&statement, params).await,
         };
+
+        if let Ok(ref mut query_result) = result {
+            if let Err(err) = self.fetch_initial_11g_query_rows(query_result).await {
+                result = Err(err);
+            }
+        }
+
+        // Seed (or reset) the BitVector decompression seed for this cursor, so a
+        // following fetch_more() against execute()-prefetched rows decompresses
+        // correctly and a re-execute never inherits a prior execution's seed.
+        if let Ok(ref query_result) = result {
+            self.update_fetch_seed_row(
+                query_result.cursor_id,
+                &query_result.rows,
+                query_result.has_more_rows,
+                true,
+            )
+            .await;
+        }
 
         // Return statement to cache or cache it for the first time
         match &result {
             Ok(query_result) => {
                 let mut inner = self.inner.lock().await;
                 if let Some(ref mut cache) = inner.statement_cache {
-                    let should_close_cursor = if statement.statement_type() == StatementType::Query {
+                    let should_close_cursor = if statement.statement_type() == StatementType::Query
+                    {
                         !query_result.has_more_rows
                     } else {
                         true // DML/DDL/PL-SQL: always close
@@ -1268,7 +1788,11 @@ impl Connection {
             let mut inner = self.inner.lock().await;
             if let Some(ref mut cache) = inner.statement_cache {
                 if let Some(cached_stmt) = cache.get(sql) {
-                    tracing::trace!(sql = sql, cursor_id = cached_stmt.cursor_id(), "Using cached statement");
+                    tracing::trace!(
+                        sql = sql,
+                        cursor_id = cached_stmt.cursor_id(),
+                        "Using cached statement"
+                    );
                     (cached_stmt, true)
                 } else {
                     (Statement::new(sql), false)
@@ -1292,6 +1816,22 @@ impl Connection {
             if query_result.columns.is_empty() && !columns.is_empty() {
                 query_result.columns = columns;
             }
+        }
+
+        if let Ok(ref mut query_result) = result {
+            if let Err(err) = self.fetch_initial_11g_query_rows(query_result).await {
+                result = Err(err);
+            }
+        }
+
+        if let Ok(ref query_result) = result {
+            self.update_fetch_seed_row(
+                query_result.cursor_id,
+                &query_result.rows,
+                query_result.has_more_rows,
+                true,
+            )
+            .await;
         }
 
         // Return statement to cache or cache it for the first time
@@ -1339,7 +1879,11 @@ impl Connection {
             let mut inner = self.inner.lock().await;
             if let Some(ref mut cache) = inner.statement_cache {
                 if let Some(cached_stmt) = cache.get(sql) {
-                    tracing::trace!(sql = sql, cursor_id = cached_stmt.cursor_id(), "Using cached DML statement");
+                    tracing::trace!(
+                        sql = sql,
+                        cursor_id = cached_stmt.cursor_id(),
+                        "Using cached DML statement"
+                    );
                     (cached_stmt, true)
                 } else {
                     (Statement::new(sql), false)
@@ -1470,7 +2014,7 @@ impl Connection {
                         Value::String(s) => std::cmp::max(s.len() as u32, 1),
                         Value::Bytes(b) => std::cmp::max(b.len() as u32, 1),
                         Value::Integer(_) | Value::Number(_) => 22, // Oracle NUMBER max size
-                        Value::Float(_) => 8, // BINARY_DOUBLE
+                        Value::Float(_) => 8,                       // BINARY_DOUBLE
                         Value::Boolean(_) => 1,
                         Value::Timestamp(_) => 13,
                         Value::Date(_) => 7,
@@ -1496,6 +2040,13 @@ impl Connection {
         let seq_num = inner.next_sequence_number();
         execute_msg.set_sequence_number(seq_num);
         let request = execute_msg.build_request_with_sdu(&inner.capabilities, large_sdu)?;
+        if std::env::var_os("ORACLE_RS_DEBUG_QUERY").is_some() {
+            eprintln!(
+                "oracle-rs query request ({} bytes): {}",
+                request.len(),
+                hex::encode(request.as_ref())
+            );
+        }
         inner.send(&request).await?;
 
         // Receive response
@@ -1571,6 +2122,13 @@ impl Connection {
         let seq_num = inner.next_sequence_number();
         execute_msg.set_sequence_number(seq_num);
         let request = execute_msg.build_request_with_sdu(&inner.capabilities, large_sdu)?;
+        if std::env::var_os("ORACLE_RS_DEBUG_QUERY").is_some() {
+            eprintln!(
+                "oracle-rs query request ({} bytes): {}",
+                request.len(),
+                hex::encode(request.as_ref())
+            );
+        }
         inner.send(&request).await?;
 
         // Receive response
@@ -1588,9 +2146,15 @@ impl Connection {
 
         // Parse the batch response
         let payload = &response[PACKET_HEADER_SIZE..];
+        let ttc_field_version = inner.capabilities.ttc_field_version;
         drop(inner); // Release lock before parsing
 
-        self.parse_batch_response(payload, batch.rows.len(), batch.options.array_dml_row_counts)
+        self.parse_batch_response(
+            payload,
+            batch.rows.len(),
+            batch.options.array_dml_row_counts,
+            ttc_field_version,
+        )
     }
 
     /// Handle MARKER packet protocol (BREAK/RESET)
@@ -1673,6 +2237,7 @@ impl Connection {
         payload: &[u8],
         batch_size: usize,
         want_row_counts: bool,
+        ttc_field_version: u8,
     ) -> Result<BatchResult> {
         if payload.len() < 3 {
             return Err(Error::Protocol("Batch response too short".to_string()));
@@ -1694,7 +2259,8 @@ impl Connection {
             match msg_type {
                 // Error (4) - may contain error or success info
                 x if x == MessageType::Error as u8 => {
-                    let (error_code, error_msg, _cid, row_count) = self.parse_error_info_with_rowcount(&mut buf)?;
+                    let (error_code, error_msg, _cid, row_count) =
+                        self.parse_error_info_with_rowcount(&mut buf, ttc_field_version)?;
                     rows_affected = row_count;
                     if error_code != 0 && error_code != 1403 {
                         return Err(Error::OracleError {
@@ -1706,7 +2272,12 @@ impl Connection {
 
                 // Parameter (8) - return parameters (may contain row counts)
                 x if x == MessageType::Parameter as u8 => {
-                    if let Some(counts) = self.parse_return_parameters_internal(&mut buf, want_row_counts)? {
+                    let supports_array_row_counts =
+                        ttc_field_version >= crate::constants::ccap_value::FIELD_VERSION_12_1;
+                    if let Some(counts) = self.parse_return_parameters_internal(
+                        &mut buf,
+                        want_row_counts && supports_array_row_counts,
+                    )? {
                         row_counts = Some(counts);
                     }
                 }
@@ -1744,6 +2315,280 @@ impl Connection {
         Ok(result)
     }
 
+    /// Last-resort deadline for [`Self::receive_fetch_response`]. Its expiry
+    /// is a loud error, never a silently truncated "complete" response, so it
+    /// only needs to be large enough to never fire on a healthy connection.
+    fn fetch_response_deadline() -> std::time::Duration {
+        std::env::var("ORACLE_RS_FETCH_RESPONSE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(std::time::Duration::from_secs)
+            .unwrap_or_else(|| std::time::Duration::from_secs(120))
+    }
+
+    /// Receive a complete fetch response using parse-driven termination.
+    ///
+    /// Every fetch round trip, on every supported server version, ends with
+    /// an in-band terminal message: an Error message carrying the end-of-call
+    /// status (error 0 = success/more rows, ORA-1403 = end of data) or a
+    /// Status message. A fetch response is therefore complete exactly when
+    /// that message has been fully received — never before, and never because
+    /// of how the server happened to packetize it. Column metadata makes the
+    /// row-bearing messages parseable here, which the generic inspector used
+    /// by `receive_response` cannot do, so this loop never has to guess from
+    /// packet sizes or inter-packet silence:
+    ///
+    /// * scanner says the stream ends mid-message or the terminal message has
+    ///   not arrived → block for the next packet (the server has more to
+    ///   send; turning slowness into truncation here is what previously lost
+    ///   rows and desynced the delta-encoded 11g row stream);
+    /// * scanner reaches the terminal message (or, on 23ai+, the server sets
+    ///   the END_OF_RESPONSE data flag) → response complete;
+    /// * scanner meets a message type it cannot classify → fall back to the
+    ///   pre-existing heuristics (short packet, 11g idle timeout) rather than
+    ///   risk stalling on an unknown stream shape.
+    async fn receive_fetch_response(
+        &self,
+        inner: &mut ConnectionInner,
+        columns: &[ColumnInfo],
+    ) -> Result<bytes::Bytes> {
+        use crate::constants::data_flags;
+
+        // 23ai+ delimits responses with the END_OF_RESPONSE data flag; the
+        // flag-driven accumulation in receive_response() is already
+        // deterministic there and also consumes messages that trail the
+        // error info (which stopping at the terminal message would cut
+        // short, leaving unread packets to desync the next call).
+        if inner.capabilities.supports_end_of_response {
+            return inner.receive_response().await;
+        }
+
+        let debug = std::env::var_os("ORACLE_RS_DEBUG_QUERY").is_some();
+        let caps = inner.capabilities.clone();
+        let legacy_11g = inner.server_info.protocol_version <= version::MIN_ACCEPTED;
+        let overall_deadline = Self::fetch_response_deadline();
+        let deadline = tokio::time::Instant::now() + overall_deadline;
+        let idle_timeout = std::time::Duration::from_secs(2);
+
+        let mut accumulated_payload: Vec<u8> = Vec::new();
+        let mut is_first_packet = true;
+        let mut scan_state = FetchScanState::default();
+        let mut scan_broken = false;
+
+        loop {
+            let packet = if scan_broken && legacy_11g && !is_first_packet {
+                // Heuristic fallback only: on 11g an idle gap is taken as
+                // end-of-response, matching the pre-existing behaviour of
+                // receive_response() for streams we cannot classify.
+                match tokio::time::timeout(idle_timeout, inner.receive()).await {
+                    Ok(result) => result?,
+                    Err(_) => break,
+                }
+            } else {
+                match tokio::time::timeout_at(deadline, inner.receive()).await {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        // The response is provably incomplete (the terminal
+                        // message has not arrived). Treating it as complete
+                        // would silently drop rows; fail loudly instead. The
+                        // connection may be left mid-response, which is why
+                        // this maps to a fatal connection error.
+                        return Err(Error::ConnectionTimeout(overall_deadline));
+                    }
+                }
+            };
+
+            if packet.len() < PACKET_HEADER_SIZE {
+                return Err(Error::Protocol("Packet too small".to_string()));
+            }
+            // Non-DATA packet (e.g., MARKER) - return as-is for special
+            // handling by the caller.
+            if packet[4] != PacketType::Data as u8 {
+                return Ok(packet);
+            }
+            let payload = &packet[PACKET_HEADER_SIZE..];
+            if payload.len() < 2 {
+                return Err(Error::Protocol("DATA packet payload too small".to_string()));
+            }
+            let data_flags_value = u16::from_be_bytes([payload[0], payload[1]]);
+            let has_end_flag =
+                (data_flags_value & (data_flags::END_OF_RESPONSE | data_flags::EOF)) != 0;
+            let has_end_message =
+                payload.len() == 3 && payload[2] == MessageType::EndOfResponse as u8;
+
+            if is_first_packet {
+                accumulated_payload.extend_from_slice(payload);
+                is_first_packet = false;
+            } else {
+                // Subsequent packets: skip the per-packet data flags
+                accumulated_payload.extend_from_slice(&payload[2..]);
+            }
+
+            if has_end_flag || has_end_message {
+                break;
+            }
+
+            if !scan_broken && accumulated_payload.len() > 2 {
+                let outcome = self.scan_fetch_message_stream(
+                    &accumulated_payload[2..],
+                    columns,
+                    &caps,
+                    &mut scan_state,
+                );
+                if debug {
+                    eprintln!(
+                        "oracle-rs receive_fetch_response: packet {} bytes, accumulated {} \
+                         bytes, scan={:?}, frontier={}",
+                        packet.len(),
+                        accumulated_payload.len(),
+                        outcome,
+                        scan_state.scan_offset,
+                    );
+                }
+                match outcome {
+                    FetchScanOutcome::Terminal => break,
+                    FetchScanOutcome::NeedMore => continue,
+                    FetchScanOutcome::Unknown => scan_broken = true,
+                }
+            }
+
+            // Heuristic termination for streams the scanner cannot classify
+            // (pre-existing receive_response() behaviour).
+            if !legacy_11g {
+                break;
+            }
+            let short_packet_slack = 64usize;
+            if packet.len() + short_packet_slack < inner.sdu_size as usize {
+                break;
+            }
+            // Full-sized 11g packet: loop; the idle timeout above concludes
+            // the response if no further packet arrives.
+        }
+
+        // Build a synthetic packet with combined payload
+        let total_len = PACKET_HEADER_SIZE + accumulated_payload.len();
+        let mut result = Vec::with_capacity(total_len);
+        if inner.large_sdu {
+            result.extend_from_slice(&(total_len as u32).to_be_bytes());
+        } else {
+            result.extend_from_slice(&(total_len as u16).to_be_bytes());
+            result.extend_from_slice(&[0, 0]); // Checksum
+        }
+        result.push(PacketType::Data as u8);
+        result.push(0); // Flags
+        result.extend_from_slice(&[0, 0]); // Header checksum
+        result.extend_from_slice(&accumulated_payload);
+        Ok(bytes::Bytes::from(result))
+    }
+
+    /// Check-only walk over the message stream of an accumulated fetch
+    /// response, mirroring exactly what `parse_fetch_response` will consume.
+    ///
+    /// `data` is the accumulated payload after the leading data flags. Only
+    /// `Error::BufferUnderflow` is treated as "more data needed": it is the
+    /// one error that appending bytes can cure. Any other parse failure is
+    /// deterministic content corruption, so the buffer is delivered
+    /// (`Terminal`) and the real parse surfaces the same error.
+    fn scan_fetch_message_stream(
+        &self,
+        data: &[u8],
+        columns: &[ColumnInfo],
+        caps: &Capabilities,
+        state: &mut FetchScanState,
+    ) -> FetchScanOutcome {
+        let base = state.scan_offset.min(data.len());
+        let mut buf = ReadBuffer::from_slice(&data[base..]);
+
+        while buf.remaining() > 0 {
+            let msg_type = match buf.read_u8() {
+                Ok(t) => t,
+                Err(_) => return FetchScanOutcome::NeedMore,
+            };
+
+            if msg_type == MessageType::Error as u8 {
+                return match self.parse_error_message_info(&mut buf, caps.ttc_field_version) {
+                    Err(Error::BufferUnderflow { .. }) => FetchScanOutcome::NeedMore,
+                    _ => FetchScanOutcome::Terminal,
+                };
+            }
+            if msg_type == MessageType::Status as u8 || msg_type == MessageType::EndOfResponse as u8
+            {
+                return FetchScanOutcome::Terminal;
+            }
+
+            if msg_type == MessageType::RowHeader as u8 {
+                match Self::scan_row_header(&mut buf) {
+                    Ok(Some(bv)) => state.bit_vector = Some(bv),
+                    Ok(None) => {}
+                    Err(Error::BufferUnderflow { .. }) => return FetchScanOutcome::NeedMore,
+                    Err(_) => return FetchScanOutcome::Terminal,
+                }
+            } else if msg_type == MessageType::RowData as u8 {
+                match self.parse_row_data_with_bitvector(
+                    &mut buf,
+                    columns,
+                    caps,
+                    state.bit_vector.as_deref(),
+                    None,
+                ) {
+                    Ok(_) => state.bit_vector = None,
+                    Err(Error::BufferUnderflow { .. }) => return FetchScanOutcome::NeedMore,
+                    Err(_) => return FetchScanOutcome::Terminal,
+                }
+            } else if msg_type == MessageType::BitVector as u8 {
+                match Self::scan_bit_vector(&mut buf, columns.len()) {
+                    Ok(Some(bv)) => state.bit_vector = Some(bv),
+                    Ok(None) => {}
+                    Err(Error::BufferUnderflow { .. }) => return FetchScanOutcome::NeedMore,
+                    Err(_) => return FetchScanOutcome::Terminal,
+                }
+            } else {
+                return FetchScanOutcome::Unknown;
+            }
+
+            state.scan_offset = base + buf.position();
+        }
+
+        // All accumulated bytes form complete messages but the terminal
+        // Error/Status message has not arrived yet: more packets are coming.
+        FetchScanOutcome::NeedMore
+    }
+
+    /// Structural skip of a RowHeader message body, byte-for-byte identical
+    /// to the RowHeader arm of `parse_fetch_response`. Returns the bit vector
+    /// if the header carried one.
+    fn scan_row_header(buf: &mut ReadBuffer) -> Result<Option<Vec<u8>>> {
+        buf.skip(1)?; // flags
+        buf.skip_ub2()?; // num requests
+        buf.skip_ub4()?; // iteration number
+        buf.skip_ub4()?; // num iters
+        buf.skip_ub2()?; // buffer length
+        let num_bytes = buf.read_ub4()?;
+        let bit_vector = if num_bytes > 0 {
+            buf.skip(1)?; // repeated length
+            Some(buf.read_bytes_vec(num_bytes as usize)?)
+        } else {
+            None
+        };
+        let rxhrid_bytes = buf.read_ub4()?;
+        if rxhrid_bytes > 0 {
+            buf.skip_raw_bytes_chunked()?;
+        }
+        Ok(bit_vector)
+    }
+
+    /// Structural skip of a BitVector message body, byte-for-byte identical
+    /// to the BitVector arm of `parse_fetch_response`.
+    fn scan_bit_vector(buf: &mut ReadBuffer, num_columns: usize) -> Result<Option<Vec<u8>>> {
+        buf.read_ub2()?; // num columns sent
+        let num_bytes = (num_columns + 7) / 8;
+        if num_bytes > 0 {
+            Ok(Some(buf.read_bytes_vec(num_bytes)?))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Fetch more rows from an open cursor
     ///
     /// This method is used when a query result has `has_more_rows == true`
@@ -1774,24 +2619,77 @@ impl Connection {
     ) -> Result<QueryResult> {
         self.ensure_ready().await?;
 
-        // Build fetch message
-        let fetch_msg = FetchMessage::new(cursor_id, fetch_size);
-
         let mut inner = self.inner.lock().await;
-        let request = fetch_msg.build_request(&inner.capabilities)?;
+        let protocol_version = inner.server_info.protocol_version;
+        let previous_values = inner.fetch_seed_rows.get(&cursor_id).cloned();
+        let request = if protocol_version <= version::MIN_ACCEPTED {
+            use crate::messages::ExecuteMessage;
+
+            let mut stmt = Statement::new("");
+            stmt.set_cursor_id(cursor_id);
+            stmt.set_columns(columns.to_vec());
+            stmt.set_executed(true);
+            stmt.set_statement_type(crate::statement::StatementType::Query);
+
+            let options = crate::messages::ExecuteOptions::for_ref_cursor(fetch_size);
+            let mut execute_msg = ExecuteMessage::new(&stmt, options);
+            execute_msg.set_sequence_number(0);
+            execute_msg.build_request_with_sdu(&inner.capabilities, inner.large_sdu)?
+        } else {
+            let mut fetch_msg = FetchMessage::new(cursor_id, fetch_size);
+            fetch_msg.set_sequence_number(inner.next_sequence_number());
+            fetch_msg.build_request_with_sdu(&inner.capabilities, inner.large_sdu)?
+        };
+
+        if std::env::var_os("ORACLE_RS_DEBUG_QUERY").is_some() {
+            eprintln!(
+                "oracle-rs fetch request ({} bytes): {}",
+                request.len(),
+                hex::encode(request.as_ref())
+            );
+        }
         inner.send(&request).await?;
 
-        // Receive and parse response
-        let response = inner.receive().await?;
+        // Receive and parse response (parse-driven termination: complete
+        // exactly when the terminal Error/Status message has arrived)
+        let response = self.receive_fetch_response(&mut inner, columns).await?;
         if response.len() <= PACKET_HEADER_SIZE {
             return Err(Error::Protocol("Empty fetch response".to_string()));
+        }
+        if std::env::var_os("ORACLE_RS_DEBUG_QUERY").is_some() {
+            eprintln!(
+                "oracle-rs fetch response ({} bytes): {}",
+                response.len(),
+                hex::encode(response.as_ref())
+            );
+        }
+
+        // Check for MARKER packet (indicates error)
+        let packet_type = response[4];
+        if packet_type == PacketType::Marker as u8 {
+            let error_response = inner.handle_marker_reset().await?;
+            let payload = &error_response[PACKET_HEADER_SIZE..];
+            return self.parse_error_response(payload);
         }
 
         // Parse row data from response
         let payload = &response[PACKET_HEADER_SIZE..];
         let caps = inner.capabilities.clone();
+        let legacy_11g = inner.server_info.protocol_version <= version::MIN_ACCEPTED;
         drop(inner); // Release lock before parsing
-        self.parse_fetch_response(payload, columns, &caps)
+        let mut result = self.parse_fetch_response(
+            payload,
+            columns,
+            &caps,
+            cursor_id,
+            previous_values.as_deref(),
+        )?;
+        if legacy_11g && !result.has_more_rows && result.rows.len() == fetch_size as usize {
+            result.has_more_rows = true;
+        }
+        self.update_fetch_seed_row(result.cursor_id, &result.rows, result.has_more_rows, false)
+            .await;
+        Ok(result)
     }
 
     /// Fetch rows from a REF CURSOR
@@ -1849,7 +2747,9 @@ impl Connection {
         use crate::messages::ExecuteMessage;
 
         if cursor.cursor_id() == 0 {
-            return Err(Error::InvalidCursor("Cursor ID is 0 (not initialized)".to_string()));
+            return Err(Error::InvalidCursor(
+                "Cursor ID is 0 (not initialized)".to_string(),
+            ));
         }
 
         self.ensure_ready().await?;
@@ -1868,14 +2768,28 @@ impl Connection {
 
         let mut inner = self.inner.lock().await;
         let large_sdu = inner.large_sdu;
-        let seq_num = inner.next_sequence_number();
-        execute_msg.set_sequence_number(seq_num);
+        let sequence_number = if inner.server_info.protocol_version <= version::MIN_ACCEPTED {
+            0
+        } else {
+            inner.next_sequence_number()
+        };
+        execute_msg.set_sequence_number(sequence_number);
 
         let request = execute_msg.build_request_with_sdu(&inner.capabilities, large_sdu)?;
+        if std::env::var_os("ORACLE_RS_DEBUG_QUERY").is_some() {
+            eprintln!(
+                "oracle-rs query request ({} bytes): {}",
+                request.len(),
+                hex::encode(request.as_ref())
+            );
+        }
         inner.send(&request).await?;
 
-        // Receive and parse response
-        let response = inner.receive().await?;
+        // Receive and parse response (parse-driven termination: complete
+        // exactly when the terminal Error/Status message has arrived)
+        let response = self
+            .receive_fetch_response(&mut inner, cursor.columns())
+            .await?;
         if response.len() <= PACKET_HEADER_SIZE {
             return Err(Error::Protocol("Empty cursor response".to_string()));
         }
@@ -1891,8 +2805,22 @@ impl Connection {
         // Parse query response - use cursor's columns since they're already defined
         let payload = &response[PACKET_HEADER_SIZE..];
         let caps = inner.capabilities.clone();
+        let legacy_11g = inner.server_info.protocol_version <= version::MIN_ACCEPTED;
+        let previous_values = inner.fetch_seed_rows.get(&cursor.cursor_id()).cloned();
         drop(inner); // Release lock before parsing
-        self.parse_fetch_response(payload, cursor.columns(), &caps)
+        let mut result = self.parse_fetch_response(
+            payload,
+            cursor.columns(),
+            &caps,
+            cursor.cursor_id(),
+            previous_values.as_deref(),
+        )?;
+        if legacy_11g && !result.has_more_rows && result.rows.len() == fetch_size as usize {
+            result.has_more_rows = true;
+        }
+        self.update_fetch_seed_row(result.cursor_id, &result.rows, result.has_more_rows, false)
+            .await;
+        Ok(result)
     }
 
     /// Fetch rows from an implicit result set
@@ -1942,7 +2870,14 @@ impl Connection {
     /// - RowHeader (6): Contains metadata about the following row data
     /// - RowData (7): Contains the actual row values
     /// - Error (4): Contains error info with cursor_id and row counts
-    fn parse_fetch_response(&self, payload: &[u8], columns: &[ColumnInfo], caps: &Capabilities) -> Result<QueryResult> {
+    fn parse_fetch_response(
+        &self,
+        payload: &[u8],
+        columns: &[ColumnInfo],
+        caps: &Capabilities,
+        cursor_id: u16,
+        previous_values_seed: Option<&[Value]>,
+    ) -> Result<QueryResult> {
         if payload.len() < 3 {
             return Err(Error::Protocol("Fetch response too short".to_string()));
         }
@@ -1950,10 +2885,11 @@ impl Connection {
         let mut buf = ReadBuffer::from_slice(payload);
         let mut rows = Vec::new();
         let mut has_more_rows = false;
+        let mut current_cursor_id = cursor_id;
 
         // Bit vector for duplicate column optimization
         let mut bit_vector: Option<Vec<u8>> = None;
-        let mut previous_row_values: Option<Vec<Value>> = None;
+        let mut previous_row_values = previous_values_seed.map(|values| values.to_vec());
 
         // Skip data flags
         buf.skip(2)?;
@@ -1973,7 +2909,7 @@ impl Connection {
                     let num_bytes = buf.read_ub4()?;
                     if num_bytes > 0 {
                         buf.skip(1)?; // skip repeated length
-                        // This bit vector in row header is for the following row data
+                                      // This bit vector in row header is for the following row data
                         let bv = buf.read_bytes_vec(num_bytes as usize)?;
                         bit_vector = Some(bv);
                     }
@@ -1983,33 +2919,49 @@ impl Connection {
                     }
                 }
                 x if x == MessageType::RowData as u8 => {
-                    // Parse actual row data with bit vector support
-                    let row = self.parse_row_data_with_bitvector(
+                    match self.parse_row_data_with_bitvector(
                         &mut buf,
                         columns,
                         caps,
                         bit_vector.as_deref(),
                         previous_row_values.as_ref(),
-                    )?;
-                    previous_row_values = Some(row.values().to_vec());
-                    bit_vector = None;
-                    rows.push(row);
+                    ) {
+                        Ok(row) => {
+                            previous_row_values = Some(row.values().to_vec());
+                            bit_vector = None;
+                            rows.push(row);
+                        }
+                        Err(Error::BufferUnderflow { .. }) => {
+                            has_more_rows = true;
+                            break;
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
                 x if x == MessageType::BitVector as u8 => {
-                    // BitVector indicates which columns have actual data vs duplicates
                     let _num_columns_sent = buf.read_ub2()?;
-                    let num_bytes = (columns.len() + 7) / 8; // Round up
+                    let num_bytes = (columns.len() + 7) / 8;
                     if num_bytes > 0 {
-                        let bv = buf.read_bytes_vec(num_bytes)?;
-                        bit_vector = Some(bv);
+                        match buf.read_bytes_vec(num_bytes) {
+                            Ok(bv) => bit_vector = Some(bv),
+                            Err(Error::BufferUnderflow { .. }) => {
+                                has_more_rows = true;
+                                break;
+                            }
+                            Err(e) => return Err(e),
+                        }
                     }
-                    // Continue processing - RowData follows
                 }
                 x if x == MessageType::Error as u8 => {
                     // Error message contains row count and cursor info
-                    let (error_code, error_msg, more_rows) = self.parse_error_message_info(&mut buf)?;
+                    let (error_code, error_msg, response_cursor_id, more_rows) =
+                        self.parse_error_message_info(&mut buf, caps.ttc_field_version)?;
+                    if response_cursor_id != 0 {
+                        current_cursor_id = response_cursor_id;
+                    }
                     has_more_rows = more_rows;
-                    if error_code != 0 && error_code != 1403 { // 1403 = no data found
+                    if error_code != 0 && error_code != 1403 {
+                        // 1403 = no data found
                         return Err(Error::OracleError {
                             code: error_code,
                             message: error_msg,
@@ -2036,31 +2988,41 @@ impl Connection {
             rows,
             rows_affected: 0,
             has_more_rows,
-            cursor_id: 0,
+            cursor_id: current_cursor_id,
         })
     }
 
     /// Parse error message info including cursor_id and row counts
-    fn parse_error_message_info(&self, buf: &mut ReadBuffer) -> Result<(u32, String, bool)> {
+    fn parse_error_message_info(
+        &self,
+        buf: &mut ReadBuffer,
+        ttc_field_version: u8,
+    ) -> Result<(u32, String, u16, bool)> {
+        use crate::constants::ccap_value;
+
         let _call_status = buf.read_ub4()?; // end of call status
         buf.skip_ub2()?; // end to end seq#
-        buf.skip_ub4()?; // current row number
-        buf.skip_ub2()?; // error number
+        let current_row_number = buf.read_ub4()?;
+        let error_num_short = buf.read_ub2()? as u32;
         buf.skip_ub2()?; // array elem error
         buf.skip_ub2()?; // array elem error
-        let _cursor_id = buf.read_ub2()?; // cursor id
+        let cursor_id = buf.read_ub2()?; // cursor id
         let _error_pos = buf.read_sb2()?; // error position
-        buf.skip(1)?; // sql type
-        buf.skip(1)?; // fatal?
-        buf.skip(1)?; // flags
-        buf.skip(1)?; // user cursor options
-        buf.skip(1)?; // UPI parameter
+        buf.skip_ub1()?; // sql type
+        buf.skip_ub1()?; // fatal?
+        buf.skip_ub1()?; // flags
+        buf.skip_ub1()?; // user cursor options
+        buf.skip_ub1()?; // UPI parameter
         let flags = buf.read_u8()?; // flags
-        // Skip rowid - fixed 10 bytes in Oracle format
-        buf.skip(10)?; // rowid is 10 bytes
+                                    // Rowid (rba, partition_id, skip 1, block_num, slot_num)
+        buf.skip_ub4()?;
+        buf.skip_ub2()?;
+        buf.skip_ub1()?;
+        buf.skip_ub4()?;
+        buf.skip_ub2()?;
         buf.skip_ub4()?; // OS error
-        buf.skip(1)?; // statement number
-        buf.skip(1)?; // call number
+        buf.skip_ub1()?; // statement number
+        buf.skip_ub1()?; // call number
         buf.skip_ub2()?; // padding
         buf.skip_ub4()?; // success iters
         let num_bytes = buf.read_ub4()?; // oerrdd
@@ -2071,34 +3033,51 @@ impl Connection {
         // Skip batch error codes
         let num_errors = buf.read_ub2()?;
         if num_errors > 0 {
-            buf.skip_raw_bytes_chunked()?;
+            buf.skip_ub1()?;
+            for _ in 0..num_errors {
+                buf.skip_ub2()?;
+            }
         }
 
         // Skip batch error offsets
         let num_offsets = buf.read_ub4()?;
         if num_offsets > 0 {
-            buf.skip_raw_bytes_chunked()?;
+            buf.skip_ub1()?;
+            for _ in 0..num_offsets {
+                buf.skip_ub4()?;
+            }
         }
 
         // Skip batch error messages
         let temp16 = buf.read_ub2()?;
         if temp16 > 0 {
-            buf.skip_raw_bytes_chunked()?;
+            buf.skip_ub1()?;
+            for _ in 0..temp16 {
+                buf.skip_ub2()?;
+                buf.read_string_with_length()?;
+                buf.skip(2)?;
+            }
         }
 
-        // Read extended error info
-        let error_num = buf.read_ub4()?;
-        let row_count = buf.read_ub8()?;
-        let more_rows = row_count > 0 || (flags & 0x20) != 0;
+        let (error_num, row_count, read_extended_info) = self.read_optional_extended_error_info(
+            buf,
+            error_num_short,
+            current_row_number as u64,
+        )?;
 
-        // Read error message if present
-        let error_msg = if error_num != 0 {
-            buf.read_string_with_length()?.unwrap_or_default()
-        } else {
-            String::new()
-        };
+        // sql_type + server_checksum were added in Oracle 20c; python-oracledb
+        // gates them on TNS_CCAP_FIELD_VERSION_20_1 (14).
+        if ttc_field_version >= ccap_value::FIELD_VERSION_20_1 && read_extended_info {
+            buf.skip_ub4()?; // sql_type
+            buf.skip_ub4()?; // server_checksum
+        }
 
-        Ok((error_num, error_msg, more_rows))
+        let more_rows = error_num == 0 && (row_count > 0 || (flags & 0x20) != 0);
+        let error_msg = self
+            .read_optional_error_message(buf, error_num)?
+            .unwrap_or_default();
+
+        Ok((error_num, error_msg, cursor_id, more_rows))
     }
 
     /// Open a scrollable cursor for bidirectional navigation
@@ -2147,7 +3126,9 @@ impl Connection {
         let response = inner.receive().await?;
 
         if response.len() <= PACKET_HEADER_SIZE {
-            return Err(Error::Protocol("Empty scrollable cursor response".to_string()));
+            return Err(Error::Protocol(
+                "Empty scrollable cursor response".to_string(),
+            ));
         }
 
         // Check for MARKER packet (indicates error - requires reset protocol)
@@ -2159,7 +3140,9 @@ impl Connection {
             // Parse error response to extract the actual Oracle error
             let _: QueryResult = self.parse_error_response(payload)?;
             // If we get here without error, something unexpected happened
-            return Err(Error::Protocol("Unexpected successful response after MARKER".to_string()));
+            return Err(Error::Protocol(
+                "Unexpected successful response after MARKER".to_string(),
+            ));
         }
 
         // Parse describe info to get columns
@@ -2253,7 +3236,8 @@ impl Connection {
 
         let payload = &response[PACKET_HEADER_SIZE..];
         // Use cursor's columns since Oracle doesn't re-send column metadata for scroll operations
-        let query_result = self.parse_query_response_with_columns(payload, &inner.capabilities, &cursor.columns)?;
+        let query_result =
+            self.parse_query_response_with_columns(payload, &inner.capabilities, &cursor.columns)?;
 
         // Use position from Oracle's response (rows_affected contains the row position)
         // For scrollable cursors, Oracle returns the row number in error_info.rowcount
@@ -2290,6 +3274,13 @@ impl Connection {
     pub async fn close_cursor(&self, cursor: &mut ScrollableCursor) -> Result<()> {
         if !cursor.is_open() {
             return Ok(());
+        }
+
+        // Drop any BitVector decompression seed held for this cursor id so it
+        // cannot be served to a later fetch on a reused cursor id.
+        {
+            let mut inner = self.inner.lock().await;
+            inner.fetch_seed_rows.remove(&cursor.cursor_id());
         }
 
         // Send close cursor message
@@ -2366,7 +3357,10 @@ impl Connection {
 
             let coll_row = &coll_info.rows[0];
             let coll_type_str = coll_row.get(0).and_then(|v| v.as_str()).unwrap_or("");
-            let elem_type_name = coll_row.get(1).and_then(|v| v.as_str()).unwrap_or("VARCHAR2");
+            let elem_type_name = coll_row
+                .get(1)
+                .and_then(|v| v.as_str())
+                .unwrap_or("VARCHAR2");
             let _elem_type_owner = coll_row.get(2).and_then(|v| v.as_str());
 
             let collection_type = match coll_type_str {
@@ -2377,7 +3371,8 @@ impl Connection {
 
             let element_type = oracle_type_from_name(elem_type_name);
 
-            let mut obj_type = DbObjectType::collection(schema, name, collection_type, element_type);
+            let mut obj_type =
+                DbObjectType::collection(schema, name, collection_type, element_type);
             obj_type.oid = type_oid;
             Ok(obj_type)
         } else {
@@ -2389,11 +3384,32 @@ impl Connection {
     }
 
     /// Internal: Execute a query statement with optional bind parameters
-    async fn execute_query_with_params(&self, statement: &Statement, params: &[Value]) -> Result<QueryResult> {
-        let prefetch_rows = 100; // Default prefetch
+    async fn execute_query_with_params(
+        &self,
+        statement: &Statement,
+        params: &[Value],
+    ) -> Result<QueryResult> {
+        // Oracle 11g (TNS 314) does not set END_OF_RESPONSE flags in data
+        // packets, so receive_response() cannot detect the end of a
+        // multi-packet result set.  Use prefetch_rows=0 for 11g so the
+        // execute returns only describe info + cursor; rows are then
+        // fetched in batches via fetch_more().
+        let protocol_version = {
+            let inner = self.inner.lock().await;
+            inner.server_info.protocol_version
+        };
+        // 11g cannot detect multi-packet end-of-response, so it defaults to no
+        // prefetch (rows fetched via fetch_more()); newer servers prefetch 100.
+        let default_prefetch_rows: u32 = if protocol_version <= version::MIN_ACCEPTED {
+            0
+        } else {
+            100
+        };
+        let prefetch_rows: u32 = std::env::var("ORACLE_RS_PREFETCH_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default_prefetch_rows);
 
-        // For first execution, check if we might have LOBs (no prefetch for safety)
-        // This can be optimized later with describe-only first
         let options = ExecuteOptions::for_query(prefetch_rows);
         let mut execute_msg = ExecuteMessage::new(statement, options);
 
@@ -2404,15 +3420,36 @@ impl Connection {
 
         let mut inner = self.inner.lock().await;
         let large_sdu = inner.large_sdu;
-        let seq_num = inner.next_sequence_number();
-        execute_msg.set_sequence_number(seq_num);
+        let sequence_number = if inner.server_info.protocol_version <= version::MIN_ACCEPTED {
+            0
+        } else {
+            inner.next_sequence_number()
+        };
+        execute_msg.set_sequence_number(sequence_number);
         let request = execute_msg.build_request_with_sdu(&inner.capabilities, large_sdu)?;
+        if std::env::var_os("ORACLE_RS_DEBUG_QUERY").is_some() {
+            eprintln!(
+                "oracle-rs query request ({} bytes): {}",
+                request.len(),
+                hex::encode(request.as_ref())
+            );
+        }
         inner.send(&request).await?;
 
-        // Receive and parse response
-        let response = inner.receive().await?;
+        // Receive response — accumulate all packets.
+        // For Oracle 11g, receive_response() uses terminal message scanning
+        // to detect end of response since END_OF_RESPONSE flags are absent.
+        let response = inner.receive_response().await?;
         if response.len() <= PACKET_HEADER_SIZE {
             return Err(Error::Protocol("Empty query response".to_string()));
+        }
+
+        if std::env::var_os("ORACLE_RS_DEBUG_QUERY").is_some() {
+            eprintln!(
+                "oracle-rs query response ({} bytes): {}",
+                response.len(),
+                hex::encode(response.as_ref())
+            );
         }
 
         // Check for MARKER packet (indicates error - requires reset protocol)
@@ -2420,6 +3457,13 @@ impl Connection {
         if packet_type == PacketType::Marker as u8 {
             // Handle marker reset protocol and get the error packet
             let error_response = inner.handle_marker_reset().await?;
+            if std::env::var_os("ORACLE_RS_DEBUG_QUERY").is_some() {
+                eprintln!(
+                    "oracle-rs query error response ({} bytes): {}",
+                    error_response.len(),
+                    hex::encode(error_response.as_ref())
+                );
+            }
             let payload = &error_response[PACKET_HEADER_SIZE..];
             return self.parse_error_response(payload);
         }
@@ -2447,11 +3491,13 @@ impl Connection {
             let seq_num = inner.next_sequence_number();
             define_msg.set_sequence_number(seq_num);
 
-            let define_request = define_msg.build_request_with_sdu(&inner.capabilities, large_sdu)?;
+            let define_request =
+                define_msg.build_request_with_sdu(&inner.capabilities, large_sdu)?;
             inner.send(&define_request).await?;
 
-            // Receive the re-execute response
-            let define_response = inner.receive().await?;
+            // Receive the re-execute response. LOB define responses can span
+            // packets when the locator/prefetch data is near the SDU boundary.
+            let define_response = inner.receive_response().await?;
             if define_response.len() <= PACKET_HEADER_SIZE {
                 return Err(Error::Protocol("Empty define response".to_string()));
             }
@@ -2460,6 +3506,13 @@ impl Connection {
             let packet_type = define_response[4];
             if packet_type == PacketType::Marker as u8 {
                 let error_response = inner.handle_marker_reset().await?;
+                if std::env::var_os("ORACLE_RS_DEBUG_QUERY").is_some() {
+                    eprintln!(
+                        "oracle-rs query define error response ({} bytes): {}",
+                        error_response.len(),
+                        hex::encode(error_response.as_ref())
+                    );
+                }
                 let payload = &error_response[PACKET_HEADER_SIZE..];
                 return self.parse_error_response(payload);
             }
@@ -2469,7 +3522,7 @@ impl Connection {
             result = self.parse_query_response_with_columns(
                 payload,
                 &inner.capabilities,
-                &stmt_with_define.columns(),
+                stmt_with_define.columns(),
             )?;
         }
 
@@ -2477,7 +3530,11 @@ impl Connection {
     }
 
     /// Internal: Execute a DML statement with optional bind parameters
-    async fn execute_dml_with_params(&self, statement: &Statement, params: &[Value]) -> Result<QueryResult> {
+    async fn execute_dml_with_params(
+        &self,
+        statement: &Statement,
+        params: &[Value],
+    ) -> Result<QueryResult> {
         let options = ExecuteOptions::for_dml(false); // Don't auto-commit
         let mut execute_msg = ExecuteMessage::new(statement, options);
 
@@ -2540,7 +3597,8 @@ impl Connection {
                                     if max_attempts == 0 {
                                         // Give up and return a generic error
                                         return Err(Error::Protocol(
-                                            "Server rejected operation (multiple BREAK markers)".to_string()
+                                            "Server rejected operation (multiple BREAK markers)"
+                                                .to_string(),
                                         ));
                                     }
                                     continue;
@@ -2548,7 +3606,10 @@ impl Connection {
                             } else if pkt_type == PacketType::Data as u8 {
                                 // Got DATA packet - use this as the response (may contain error)
                                 let payload = &pkt[PACKET_HEADER_SIZE..];
-                                return self.parse_dml_response(payload);
+                                return self.parse_dml_response(
+                                    payload,
+                                    inner.capabilities.ttc_field_version,
+                                );
                             } else {
                                 break;
                             }
@@ -2611,7 +3672,7 @@ impl Connection {
 
         // Parse the response to extract rows affected (or error)
         let payload = &response[PACKET_HEADER_SIZE..];
-        self.parse_dml_response(payload)
+        self.parse_dml_response(payload, inner.capabilities.ttc_field_version)
     }
 
     /// Parse query response to extract columns and rows
@@ -2623,6 +3684,319 @@ impl Connection {
     /// - Error (4): completion status (may contain error or success)
     fn parse_query_response(&self, payload: &[u8], caps: &Capabilities) -> Result<QueryResult> {
         self.parse_query_response_with_columns(payload, caps, &[])
+    }
+
+    fn is_query_response_message_type(msg_type: u8) -> bool {
+        matches!(
+            msg_type,
+            x if x == MessageType::RowHeader as u8
+                || x == MessageType::RowData as u8
+                || x == MessageType::Error as u8
+                || x == MessageType::Parameter as u8
+                || x == MessageType::Status as u8
+                || x == MessageType::BitVector as u8
+                || x == MessageType::EndOfResponse as u8
+        )
+    }
+
+    fn read_u16_be_at(data: &[u8], pos: usize) -> Option<u16> {
+        let bytes = data.get(pos..pos + 2)?;
+        Some(u16::from_be_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn read_u32_legacy_at(data: &[u8], pos: usize, max_value: u32) -> Option<u32> {
+        let bytes = data.get(pos..pos + 4)?;
+        let be = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        if be <= max_value {
+            return Some(be);
+        }
+
+        let le = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        if le <= max_value {
+            Some(le)
+        } else {
+            None
+        }
+    }
+
+    fn skip_legacy_11g_raw(data: &[u8], pos: usize, len: usize) -> Option<usize> {
+        if len == 0 {
+            return Some(pos);
+        }
+
+        if data.get(pos).copied() == Some(len as u8) && pos + 1 + len <= data.len() {
+            Some(pos + 1 + len)
+        } else if pos + len <= data.len() {
+            Some(pos + len)
+        } else {
+            None
+        }
+    }
+
+    fn try_parse_legacy_11g_describe_at(
+        &self,
+        data: &[u8],
+        pos: usize,
+        num_columns: usize,
+    ) -> Option<(Vec<ColumnInfo>, usize)> {
+        if !(1..=1024).contains(&num_columns) {
+            return None;
+        }
+
+        let mut p = pos + 8;
+        let mut columns = Vec::with_capacity(num_columns);
+
+        for _ in 0..num_columns {
+            let ora_type_num = *data.get(p)?;
+            let precision = *data.get(p + 2)? as i8 as i16;
+            let scale = *data.get(p + 3)? as i8 as i16;
+            p += 4;
+
+            let buffer_size = Self::read_u32_legacy_at(data, p, 1_000_000)?;
+            p += 4;
+            p += 4; // max_num_array_elements
+            p += 8; // cont_flags
+
+            let oid_length = Self::read_u32_legacy_at(data, p, data.len() as u32)? as usize;
+            p += 4;
+            p = p.checked_add(oid_length)?;
+            data.get(p)?;
+
+            p += 2; // version
+            p += 2; // charset_id
+            let csfrm = *data.get(p)?;
+            p += 1;
+
+            let max_size = *data.get(p)? as u32;
+            p += 1;
+            let nullable = *data.get(p)? != 0;
+            p += 1;
+            p += 1; // v7 length of name
+
+            let name_len = Self::read_u32_legacy_at(data, p, data.len() as u32)? as usize;
+            p += 4;
+            let name_bytes = data.get(p..p + name_len)?;
+            let name = String::from_utf8_lossy(name_bytes).to_string();
+            p += name_len;
+
+            let schema_len = Self::read_u32_legacy_at(data, p, data.len() as u32)? as usize;
+            p += 4 + schema_len;
+            data.get(p)?;
+
+            let type_name_len = Self::read_u32_legacy_at(data, p, data.len() as u32)? as usize;
+            p += 4 + type_name_len;
+            data.get(p)?;
+
+            let _position = Self::read_u16_be_at(data, p)?;
+            p += 2;
+            p += 4; // uds_flags
+
+            let oracle_type = OracleType::try_from(ora_type_num).unwrap_or(OracleType::Varchar);
+            let mut col = ColumnInfo::new(name, oracle_type);
+            col.buffer_size = buffer_size;
+            col.data_size = if max_size > 0 { max_size } else { buffer_size };
+            col.precision = precision;
+            col.scale = scale;
+            col.nullable = nullable;
+            col.csfrm = csfrm;
+            columns.push(col);
+        }
+
+        let current_date_len = Self::read_u32_legacy_at(data, p, data.len() as u32)? as usize;
+        p += 4;
+        p = Self::skip_legacy_11g_raw(data, p, current_date_len)?;
+
+        p += 16; // dcbflag, dcbmdbz, dcbmnpr, dcbmxpr
+        let qcky_len = Self::read_u32_legacy_at(data, p, data.len() as u32)? as usize;
+        p += 4;
+        p = Self::skip_legacy_11g_raw(data, p, qcky_len)?;
+
+        Some((columns, p))
+    }
+
+    fn parse_legacy_11g_describe_info(
+        &self,
+        buf: &mut ReadBuffer,
+        describe_start: usize,
+    ) -> Result<Option<Vec<ColumnInfo>>> {
+        let data = buf.as_bytes();
+        let bytes = data.as_ref();
+
+        for pos in describe_start..bytes.len().saturating_sub(8) {
+            let Some(num_columns) = Self::read_u32_legacy_at(bytes, pos, 1024) else {
+                continue;
+            };
+            let Some(max_row_size) = Self::read_u32_legacy_at(bytes, pos + 4, 1_000_000) else {
+                continue;
+            };
+            if num_columns == 0 || num_columns > 1024 || max_row_size > 1_000_000 {
+                continue;
+            }
+
+            let Some((columns, end_pos)) =
+                self.try_parse_legacy_11g_describe_at(bytes, pos, num_columns as usize)
+            else {
+                continue;
+            };
+            if columns.is_empty()
+                || !bytes
+                    .get(end_pos)
+                    .copied()
+                    .is_some_and(Self::is_query_response_message_type)
+            {
+                continue;
+            }
+
+            buf.set_position(end_pos)?;
+            return Ok(Some(columns));
+        }
+
+        Ok(None)
+    }
+
+    fn skip_legacy_11g_row_header(&self, buf: &mut ReadBuffer) -> Result<()> {
+        let start = buf.position();
+        let remaining = buf.remaining_slice();
+
+        for (skip, &byte) in remaining.iter().enumerate() {
+            if byte == MessageType::RowData as u8
+                || byte == MessageType::Error as u8
+                || byte == MessageType::BitVector as u8
+            {
+                buf.set_position(start + skip)?;
+                return Ok(());
+            }
+        }
+
+        Err(Error::Protocol(
+            "Unable to skip Oracle 11g row header".to_string(),
+        ))
+    }
+
+    fn skip_legacy_11g_parameter(&self, buf: &mut ReadBuffer) -> Result<()> {
+        let start = buf.position();
+        let remaining = buf.remaining_slice();
+
+        for (skip, &byte) in remaining.iter().enumerate() {
+            if byte == MessageType::Error as u8
+                || byte == MessageType::Status as u8
+                || byte == MessageType::EndOfResponse as u8
+            {
+                buf.set_position(start + skip)?;
+                return Ok(());
+            }
+        }
+
+        Err(Error::Protocol(
+            "Unable to skip Oracle 11g parameter message".to_string(),
+        ))
+    }
+
+    fn parse_query_describe_info(
+        &self,
+        buf: &mut ReadBuffer,
+        caps: &Capabilities,
+    ) -> Result<(Vec<ColumnInfo>, Option<Vec<u8>>)> {
+        // The describe info response starts with a TNS chunked-encoded
+        // prefix (current date, dcb flags, etc.) followed by the column
+        // metadata.  On Oracle 12c+ the chunked prefix is small and
+        // skip_raw_bytes_chunked works.  On Oracle 11g the **entire**
+        // response (including column metadata, row data, and the error
+        // trailer) is delivered inside a single chunked stream.
+        //
+        // Strategy: read the chunked prefix.  If the next byte after the
+        // prefix is a valid query-response message type we are done.
+        // Otherwise de-chunk the remaining data and re-parse from the
+        // de-chunked buffer.
+
+        let describe_start = buf.position();
+
+        // Try the 12c+ path first: skip the chunked prefix, then parse
+        // describe info directly from the remaining buffer.
+        buf.skip_raw_bytes_chunked()?;
+        let after_prefix = buf.position();
+        let columns = self.parse_describe_info(buf, caps.ttc_field_version)?;
+        if !columns.is_empty()
+            && (caps.is_legacy_11g_ttc()
+                || buf
+                    .remaining_slice()
+                    .first()
+                    .copied()
+                    .is_some_and(Self::is_query_response_message_type))
+        {
+            return Ok((columns, None));
+        }
+
+        // 11g fallback: some captures place a short chunked prelude ahead of
+        // the actual describe metadata. Scan the remaining outer buffer for a
+        // valid describe-info block and advance the original cursor to the end
+        // of the parsed metadata when found.
+        buf.set_position(after_prefix)?;
+        let remaining = buf.remaining_slice();
+        let ttc_ver = caps.ttc_field_version;
+        for skip in 0..remaining.len().saturating_sub(4) {
+            let mut probe = ReadBuffer::from_slice(&remaining[skip..]);
+            let Ok(cols) = self.parse_describe_info(&mut probe, ttc_ver) else {
+                continue;
+            };
+            if cols.is_empty()
+                || !probe
+                    .remaining_slice()
+                    .first()
+                    .copied()
+                    .is_some_and(Self::is_query_response_message_type)
+            {
+                continue;
+            }
+            buf.set_position(after_prefix + skip + probe.position())?;
+            return Ok((cols, None));
+        }
+
+        if caps.is_legacy_11g_ttc() {
+            if let Some(cols) = self.parse_legacy_11g_describe_info(buf, describe_start)? {
+                return Ok((cols, None));
+            }
+        }
+
+        // Final fallback: re-read from the original position and de-chunk the
+        // prefix bytes themselves for older captures where the metadata really
+        // is nested inside a chunked blob.
+        buf.set_position(describe_start)?;
+        let dechunked = buf.read_raw_bytes_chunked()?;
+        if std::env::var_os("ORACLE_RS_DEBUG_QUERY").is_some() {
+            eprintln!(
+                "oracle-rs 11g dechunked describe ({} bytes), outer remaining={}",
+                dechunked.len(),
+                buf.remaining(),
+            );
+        }
+        if dechunked.is_empty() {
+            return Ok((Vec::new(), None));
+        }
+
+        let outer_remaining = buf.remaining_slice().to_vec();
+        for skip in 0..dechunked.len().saturating_sub(4) {
+            let mut probe = ReadBuffer::from_slice(&dechunked[skip..]);
+            let Ok(cols) = self.parse_describe_info(&mut probe, ttc_ver) else {
+                continue;
+            };
+            if cols.is_empty()
+                || !probe
+                    .remaining_slice()
+                    .first()
+                    .copied()
+                    .is_some_and(Self::is_query_response_message_type)
+            {
+                continue;
+            }
+            let mut inline_tail = probe.remaining_slice().to_vec();
+            inline_tail.extend_from_slice(&outer_remaining);
+            return Ok((cols, Some(inline_tail)));
+        }
+
+        Err(Error::Protocol(
+            "Unable to parse Oracle 11g describe info from de-chunked payload".to_string(),
+        ))
     }
 
     /// Parse query response with pre-known columns (for re-execute after define)
@@ -2654,57 +4028,131 @@ impl Connection {
         // Previous row values for copying duplicates
         let mut previous_row_values: Option<Vec<Value>> = None;
 
-        // Process messages until we hit end of response or run out of data
+        // Hoisted once instead of re-reading the environment on every message.
+        let debug = std::env::var_os("ORACLE_RS_DEBUG_QUERY").is_some();
+
+        // Process messages until we hit end of response or run out of data.
+        // On Oracle 11g a single TNS packet may not contain all rows; when
+        // we hit a BufferUnderflow while parsing row data we return what we
+        // have so far with has_more_rows = true so the caller can use
+        // fetch_more().
         while !end_of_response && buf.remaining() > 0 {
+            let msg_pos = buf.position();
             let msg_type = buf.read_u8()?;
+
+            if debug {
+                eprintln!(
+                    "oracle-rs query msg_type={} payload_offset={} remaining={}",
+                    msg_type,
+                    msg_pos,
+                    buf.remaining()
+                );
+            }
 
             match msg_type {
                 // DescribeInfo (16) - column metadata
                 x if x == MessageType::DescribeInfo as u8 => {
-                    // Skip chunked bytes first
-                    buf.skip_raw_bytes_chunked()?;
-                    columns = self.parse_describe_info(&mut buf, caps.ttc_field_version)?;
+                    let (parsed_columns, inline_tail) =
+                        self.parse_query_describe_info(&mut buf, caps)?;
+                    columns = parsed_columns;
+                    if let Some(inline_tail) = inline_tail {
+                        buf = ReadBuffer::from_vec(inline_tail);
+                    }
                 }
 
                 // RowHeader (6) - header info for rows
                 x if x == MessageType::RowHeader as u8 => {
-                    self.parse_row_header(&mut buf)?;
+                    let row_header_start = buf.position();
+                    match self.parse_row_header(&mut buf) {
+                        Ok(()) => {
+                            if caps.ttc_field_version
+                                <= crate::constants::ccap_value::FIELD_VERSION_11_2
+                                && !buf
+                                    .remaining_slice()
+                                    .first()
+                                    .copied()
+                                    .is_some_and(Self::is_query_response_message_type)
+                            {
+                                buf.set_position(row_header_start)?;
+                                self.skip_legacy_11g_row_header(&mut buf)?;
+                            }
+                        }
+                        Err(Error::BufferUnderflow { .. })
+                            if caps.ttc_field_version
+                                <= crate::constants::ccap_value::FIELD_VERSION_11_2 =>
+                        {
+                            buf.set_position(row_header_start)?;
+                            self.skip_legacy_11g_row_header(&mut buf)?;
+                        }
+                        Err(Error::BufferUnderflow { .. }) => break,
+                        Err(e) => return Err(e),
+                    }
                 }
 
                 // RowData (7) - actual row values
                 x if x == MessageType::RowData as u8 => {
-                    let row = self.parse_row_data_with_bitvector(
+                    match self.parse_row_data_with_bitvector(
                         &mut buf,
                         &columns,
                         caps,
                         bit_vector.as_deref(),
                         previous_row_values.as_ref(),
-                    )?;
-                    // Store this row's values for potential duplicate copying
-                    previous_row_values = Some(row.values().to_vec());
-                    // Clear bit vector after using it (it's per-row)
-                    bit_vector = None;
-                    rows.push(row);
+                    ) {
+                        Ok(row) => {
+                            previous_row_values = Some(row.values().to_vec());
+                            bit_vector = None;
+                            rows.push(row);
+                        }
+                        Err(Error::BufferUnderflow { .. }) => {
+                            // Partial packet — return rows parsed so far
+                            break;
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
 
                 // Error (4) - completion or error
                 x if x == MessageType::Error as u8 => {
-                    let (error_code, error_msg, cid, rc) = self.parse_error_info_with_rowcount(&mut buf)?;
+                    let parsed_error =
+                        self.parse_error_info_with_rowcount(&mut buf, caps.ttc_field_version);
+                    let (error_code, error_msg, cid, rc) = match parsed_error {
+                        Ok(parsed) => parsed,
+                        Err(Error::BufferUnderflow { .. } | Error::InvalidLengthIndicator(_))
+                            if caps.is_legacy_11g_ttc() && !rows.is_empty() =>
+                        {
+                            end_of_response = true;
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    };
                     cursor_id = cid;
                     row_count = rc;
                     if error_code != 0 && error_code != 1403 {
-                        // 1403 is "no data found" which is not an error for queries
                         return Err(Error::OracleError {
                             code: error_code,
                             message: error_msg.unwrap_or_default(),
                         });
                     }
-                    end_of_response = true;
+                    // error_code=1403 means "no data found" = truly done.
+                    // error_code=0 means success; if rows < prefetch count,
+                    // there may be more rows to fetch.
+                    end_of_response = error_code == 1403;
                 }
 
                 // Parameter (8) - return parameters
                 x if x == MessageType::Parameter as u8 => {
-                    self.parse_return_parameters(&mut buf)?;
+                    let parameter_start = buf.position();
+                    match self.parse_return_parameters(&mut buf) {
+                        Ok(()) => {}
+                        Err(Error::BufferUnderflow { .. } | Error::InvalidLengthIndicator(_))
+                            if caps.is_legacy_11g_ttc() =>
+                        {
+                            buf.set_position(parameter_start)?;
+                            self.skip_legacy_11g_parameter(&mut buf)?;
+                        }
+                        Err(Error::BufferUnderflow { .. }) => break,
+                        Err(e) => return Err(e),
+                    }
                 }
 
                 // Status (9) - call status
@@ -2712,25 +4160,24 @@ impl Connection {
                     // Read call status and end-to-end seq number
                     let _call_status = buf.read_ub4()?;
                     let _end_to_end_seq = buf.read_ub2()?;
-                    // Note: end_of_response only if supports_end_of_response is false
-                    // For now, we assume it's not the end
                 }
 
                 // BitVector (21) - column presence bitmap for sparse results
                 // Bit=1 means actual data is sent, bit=0 means duplicate from previous row
                 21 => {
-                    // Read num columns sent
-                    let _num_columns_sent = buf.read_ub2()?;
-                    // Read bit vector (1 byte per 8 columns, rounded up)
+                    let num_cols_sent = buf.read_ub2()?;
+                    let _ = num_cols_sent;
                     let num_bytes = (columns.len() + 7) / 8;
                     if num_bytes > 0 {
-                        let bv = buf.read_bytes_vec(num_bytes)?;
-                        bit_vector = Some(bv);
+                        match buf.read_bytes_vec(num_bytes) {
+                            Ok(bv) => bit_vector = Some(bv),
+                            Err(Error::BufferUnderflow { .. }) => break,
+                            Err(e) => return Err(e),
+                        }
                     }
                 }
 
                 _ => {
-                    // Unknown message type - break to avoid parsing errors
                     break;
                 }
             }
@@ -2740,7 +4187,7 @@ impl Connection {
             columns,
             rows,
             rows_affected: row_count,
-            has_more_rows: false,
+            has_more_rows: !end_of_response && cursor_id > 0,
             cursor_id,
         })
     }
@@ -2822,7 +4269,8 @@ impl Connection {
                 // DescribeInfo (16) - for REF CURSOR describe
                 x if x == MessageType::DescribeInfo as u8 => {
                     buf.skip_raw_bytes_chunked()?;
-                    let cursor_columns = self.parse_describe_info(&mut buf, caps.ttc_field_version)?;
+                    let cursor_columns =
+                        self.parse_describe_info(&mut buf, caps.ttc_field_version)?;
                     // Store cursor columns if needed
                     let _ = cursor_columns; // For now, just skip
                 }
@@ -2835,7 +4283,8 @@ impl Connection {
 
                 // Error (4) - completion or error
                 x if x == MessageType::Error as u8 => {
-                    let (error_code, error_msg, _cid, rc) = self.parse_error_info_with_rowcount(&mut buf)?;
+                    let (error_code, error_msg, _cid, rc) =
+                        self.parse_error_info_with_rowcount(&mut buf, caps.ttc_field_version)?;
                     row_count = rc;
                     if error_code != 0 {
                         return Err(Error::OracleError {
@@ -2888,7 +4337,11 @@ impl Connection {
     ///   - num_bytes: ub1 + raw bytes (metadata to skip)
     ///   - describe_info: column metadata
     ///   - cursor_id: ub2
-    fn parse_implicit_results(&self, buf: &mut ReadBuffer, caps: &Capabilities) -> Result<ImplicitResults> {
+    fn parse_implicit_results(
+        &self,
+        buf: &mut ReadBuffer,
+        caps: &Capabilities,
+    ) -> Result<ImplicitResults> {
         let num_results = buf.read_ub4()?;
         let mut results = ImplicitResults::new();
 
@@ -2958,7 +4411,11 @@ impl Connection {
         let mut out_indices = Vec::new();
         let mut out_columns = Vec::new();
 
-        for i in 0..(num_binds as usize).min(params.len()) {
+        for (i, param) in params
+            .iter()
+            .enumerate()
+            .take((num_binds as usize).min(params.len()))
+        {
             let dir_byte = buf.read_u8()?;
             let dir = BindDirection::try_from(dir_byte).unwrap_or(BindDirection::Input);
 
@@ -2967,7 +4424,6 @@ impl Connection {
                 out_indices.push(i);
 
                 // Create a column info for parsing the OUT value
-                let param = &params[i];
                 let mut col = ColumnInfo::new(format!("OUT_{}", i), param.oracle_type);
                 col.buffer_size = param.buffer_size;
                 col.data_size = param.buffer_size;
@@ -2976,7 +4432,8 @@ impl Connection {
                 // For collection OUT params, extract element type from the placeholder
                 if let Some(Value::Collection(ref placeholder)) = param.value {
                     if let Some(Value::Integer(elem_type_code)) = placeholder.get("_element_type") {
-                        col.element_type = crate::constants::OracleType::try_from(*elem_type_code as u8).ok();
+                        col.element_type =
+                            crate::constants::OracleType::try_from(*elem_type_code as u8).ok();
                     }
                 }
 
@@ -2989,26 +4446,27 @@ impl Connection {
 
     /// Parse row header (TNS_MSG_TYPE_ROW_HEADER = 6)
     fn parse_row_header(&self, buf: &mut ReadBuffer) -> Result<()> {
-        buf.skip_ub1()?;  // flags
-        buf.skip_ub2()?;  // num requests
-        buf.skip_ub4()?;  // iteration number
-        buf.skip_ub4()?;  // num iters
-        buf.skip_ub2()?;  // buffer length
+        buf.skip_ub1()?; // flags
+        buf.skip_ub2()?; // num requests
+        buf.skip_ub4()?; // iteration number
+        buf.skip_ub4()?; // num iters
+        buf.skip_ub2()?; // buffer length
         let num_bytes = buf.read_ub4()? as usize;
         if num_bytes > 0 {
-            buf.skip_ub1()?;  // skip repeated length
-            buf.skip(num_bytes)?;  // bit vector
+            buf.skip_ub1()?; // skip repeated length
+            buf.skip(num_bytes)?; // bit vector
         }
         let num_bytes = buf.read_ub4()? as usize;
         if num_bytes > 0 {
-            buf.skip_raw_bytes_chunked()?;  // rxhrid
+            buf.skip_raw_bytes_chunked()?; // rxhrid
         }
         Ok(())
     }
 
     /// Parse return parameters (TNS_MSG_TYPE_PARAMETER = 8)
     fn parse_return_parameters(&self, buf: &mut ReadBuffer) -> Result<()> {
-        self.parse_return_parameters_internal(buf, false).map(|_| ())
+        self.parse_return_parameters_internal(buf, false)
+            .map(|_| ())
     }
 
     /// Parse return parameters with optional row counts extraction
@@ -3018,29 +4476,49 @@ impl Connection {
         buf: &mut ReadBuffer,
         want_row_counts: bool,
     ) -> Result<Option<Vec<u64>>> {
-        // Per Python's _process_return_parameters
-        let num_params = buf.read_ub2()?;  // al8o4l (ignored)
+        // Layout per go-ora command.go case 8:
+        //   size      = UB2          (al8o4l count)
+        //   [size]    = UB4 each     (SCN + remaining values)
+        //   reg       = UB2          (registration)
+        //   num_pairs = UB2
+        //   [pairs]   = key(DLC) + val(DLC) + keyword_num(UB4)
+        //   queryID   = UB4 size + bytes  (TTCVersion >= 4)
+        //   rowcounts = UB4 count + UB8 each (TTCVersion >= 7)
+
+        let num_params = buf.read_ub2()?;
         for _ in 0..num_params {
             buf.skip_ub4()?;
         }
 
-        let al8txl = buf.read_ub2()?;  // al8txl (ignored)
-        if al8txl > 0 {
-            buf.skip(al8txl as usize)?;
+        // registration
+        let reg = buf.read_ub2()?;
+        if reg > 0 {
+            buf.skip(reg as usize)?;
         }
 
-        // num key/value pairs - skip for now
+        // key/value pairs (DLC format: UB4 length, then CLR chunked data)
         let num_pairs = buf.read_ub2()?;
         for _ in 0..num_pairs {
-            buf.read_bytes_with_length()?;  // text value
-            buf.read_bytes_with_length()?;  // binary value
-            buf.skip_ub2()?;  // keyword num
+            // key: UB4 length + chunked bytes
+            let key_len = buf.read_ub4()?;
+            if key_len > 0 {
+                buf.skip_raw_bytes_chunked()?;
+            }
+            // value: UB4 length + chunked bytes
+            let val_len = buf.read_ub4()?;
+            if val_len > 0 {
+                buf.skip_raw_bytes_chunked()?;
+            }
+            // keyword num (UB4)
+            buf.skip_ub4()?;
         }
 
-        // registration
-        let num_bytes = buf.read_ub2()?;
-        if num_bytes > 0 {
-            buf.skip(num_bytes as usize)?;
+        // queryID (TTCVersion >= 4)
+        {
+            let qid_size = buf.read_ub4()? as usize;
+            if qid_size > 0 {
+                buf.skip(qid_size)?;
+            }
         }
 
         // If arraydmlrowcounts was requested, parse the row counts
@@ -3128,7 +4606,12 @@ impl Connection {
     }
 
     /// Parse a single column value from the buffer
-    fn parse_column_value(&self, buf: &mut ReadBuffer, col: &ColumnInfo, caps: &Capabilities) -> Result<Value> {
+    fn parse_column_value(
+        &self,
+        buf: &mut ReadBuffer,
+        col: &ColumnInfo,
+        caps: &Capabilities,
+    ) -> Result<Value> {
         use crate::constants::OracleType;
 
         // Handle LOB columns specially - they have a different format
@@ -3275,7 +4758,10 @@ impl Connection {
             Some(data) if data.is_empty() => Ok(Value::Null),
             Some(data) => {
                 // Create a placeholder type based on column info
-                let type_name = col.type_name.clone().unwrap_or_else(|| "UNKNOWN".to_string());
+                let type_name = col
+                    .type_name
+                    .clone()
+                    .unwrap_or_else(|| "UNKNOWN".to_string());
 
                 // Try to determine if this is a collection based on the pickle data
                 // The first byte contains flags - check for IS_COLLECTION (0x08)
@@ -3283,14 +4769,16 @@ impl Connection {
 
                 if is_collection {
                     // Get element type from column info or default to VARCHAR
-                    let element_type = col.element_type.unwrap_or(crate::constants::OracleType::Varchar);
+                    let element_type = col
+                        .element_type
+                        .unwrap_or(crate::constants::OracleType::Varchar);
 
                     // Determine collection type from pickle flags
                     // Collection flags are after header - but we'll default for now
                     let collection_type = CollectionType::Varray;
 
                     let obj_type = DbObjectType::collection(
-                        &col.type_schema.clone().unwrap_or_default(),
+                        col.type_schema.clone().unwrap_or_default(),
                         &type_name,
                         collection_type,
                         element_type,
@@ -3299,7 +4787,11 @@ impl Connection {
                     match decode_collection(&obj_type, &data) {
                         Ok(collection) => Ok(Value::Collection(collection)),
                         Err(e) => {
-                            tracing::warn!("Failed to decode collection: {}, data: {:02x?}", e, &data[..std::cmp::min(20, data.len())]);
+                            tracing::warn!(
+                                "Failed to decode collection: {}, data: {:02x?}",
+                                e,
+                                &data[..std::cmp::min(20, data.len())]
+                            );
                             // Return raw bytes as fallback
                             Ok(Value::Bytes(data))
                         }
@@ -3431,7 +4923,7 @@ impl Connection {
         // Current row number
         buf.skip_ub4()?;
         // Error number (short form)
-        buf.skip_ub2()?;
+        let error_num_short = buf.read_ub2()? as u32;
         // Array elem error
         buf.skip_ub2()?;
         // Array elem error
@@ -3458,7 +4950,7 @@ impl Connection {
         buf.skip_ub1()?; // skip
         buf.skip_ub4()?; // block_num
         buf.skip_ub2()?; // slot_num
-        // OS error
+                         // OS error
         buf.skip_ub4()?;
         // Statement number
         buf.skip_ub1()?;
@@ -3477,45 +4969,96 @@ impl Connection {
         // Batch error codes array
         let num_batch_errors = buf.read_ub2()?;
         if num_batch_errors > 0 {
-            buf.skip_ub1()?;  // first byte
+            buf.skip_ub1()?; // first byte
             for _ in 0..num_batch_errors {
-                buf.skip_ub2()?;  // error code
+                buf.skip_ub2()?; // error code
             }
         }
 
         // Batch error row offset array
         let num_offsets = buf.read_ub4()?;
         if num_offsets > 0 {
-            buf.skip_ub1()?;  // first byte
+            buf.skip_ub1()?; // first byte
             for _ in 0..num_offsets {
-                buf.skip_ub4()?;  // offset
+                buf.skip_ub4()?; // offset
             }
         }
 
         // Batch error messages array
         let num_batch_msgs = buf.read_ub2()?;
         if num_batch_msgs > 0 {
-            buf.skip_ub1()?;  // packed size
+            buf.skip_ub1()?; // packed size
             for _ in 0..num_batch_msgs {
-                buf.skip_ub2()?;  // chunk length
-                buf.read_string_with_length()?;  // message
-                buf.skip(2)?;  // end marker
+                buf.skip_ub2()?; // chunk length
+                buf.read_string_with_length()?; // message
+                buf.skip(2)?; // end marker
             }
         }
 
-        // Extended error number (UB4)
-        let error_code = buf.read_ub4()?;
-        // Row count (UB8)
-        let _row_count = buf.read_ub8()?;
+        let (error_code, _, _) = self.read_optional_extended_error_info(buf, error_num_short, 0)?;
 
         // Error message
-        let error_msg = if error_code != 0 {
-            buf.read_string_with_length()?.map(|s| s.trim().to_string())
-        } else {
-            None
-        };
+        let error_msg = self.read_optional_error_message(buf, error_code)?;
 
         Ok((error_code, error_msg, cursor_id))
+    }
+
+    fn read_optional_extended_error_info(
+        &self,
+        buf: &mut ReadBuffer,
+        short_error_code: u32,
+        fallback_row_count: u64,
+    ) -> Result<(u32, u64, bool)> {
+        let saved_pos = buf.position();
+        let extended_error_code = match buf.read_ub4() {
+            Ok(value) => value,
+            Err(Error::InvalidLengthIndicator(_) | Error::BufferUnderflow { .. }) => {
+                let _ = buf.set_position(saved_pos);
+                return Ok((short_error_code, fallback_row_count, false));
+            }
+            Err(err) => return Err(err),
+        };
+
+        let row_count = match buf.read_ub8() {
+            Ok(value) => value,
+            Err(Error::InvalidLengthIndicator(_) | Error::BufferUnderflow { .. }) => {
+                let _ = buf.set_position(saved_pos);
+                return Ok((short_error_code, fallback_row_count, false));
+            }
+            Err(err) => return Err(err),
+        };
+
+        let error_code = if extended_error_code != 0 {
+            extended_error_code
+        } else {
+            short_error_code
+        };
+        Ok((error_code, row_count, true))
+    }
+
+    fn read_optional_error_message(
+        &self,
+        buf: &mut ReadBuffer,
+        error_code: u32,
+    ) -> Result<Option<String>> {
+        if error_code == 0 {
+            return Ok(None);
+        }
+
+        match buf.read_string_with_length() {
+            Ok(message) => Ok(message.map(|s| s.trim().to_string())),
+            Err(Error::InvalidLengthIndicator(_)) => {
+                let raw = String::from_utf8_lossy(buf.remaining_bytes())
+                    .trim()
+                    .to_string();
+                if raw.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(raw))
+                }
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Parse error response packet (received after marker reset)
@@ -3535,20 +5078,20 @@ impl Connection {
         // Check for error message type (4)
         if msg_type == MessageType::Error as u8 {
             // Parse error info per Python's _process_error_info
-            let _call_status = buf.read_ub4()?;  // end of call status
-            buf.skip_ub2()?;  // end to end seq#
-            buf.skip_ub4()?;  // current row number
-            buf.skip_ub2()?;  // error number (short form)
-            buf.skip_ub2()?;  // array elem error
-            buf.skip_ub2()?;  // array elem error
-            let _cursor_id = buf.read_ub2()?;  // cursor id
-            let _error_pos = buf.read_sb2()?;  // error position
-            buf.skip_ub1()?;  // sql type (19c and earlier)
-            buf.skip_ub1()?;  // fatal?
-            buf.skip_ub1()?;  // flags
-            buf.skip_ub1()?;  // user cursor options
-            buf.skip_ub1()?;  // UPI parameter
-            buf.skip_ub1()?;  // flags
+            let _call_status = buf.read_ub4()?; // end of call status
+            buf.skip_ub2()?; // end to end seq#
+            buf.skip_ub4()?; // current row number
+            let error_num_short = buf.read_ub2()? as u32; // error number (short form)
+            buf.skip_ub2()?; // array elem error
+            buf.skip_ub2()?; // array elem error
+            let _cursor_id = buf.read_ub2()?; // cursor id
+            let _error_pos = buf.read_sb2()?; // error position
+            buf.skip_ub1()?; // sql type (19c and earlier)
+            buf.skip_ub1()?; // fatal?
+            buf.skip_ub1()?; // flags
+            buf.skip_ub1()?; // user cursor options
+            buf.skip_ub1()?; // UPI parameter
+            buf.skip_ub1()?; // flags
 
             // Rowid (rba, partition_id, skip 1, block_num, slot_num)
             buf.skip_ub4()?; // rba
@@ -3557,11 +5100,11 @@ impl Connection {
             buf.skip_ub4()?; // block_num
             buf.skip_ub2()?; // slot_num
 
-            buf.skip_ub4()?;  // OS error
-            buf.skip_ub1()?;  // statement number
-            buf.skip_ub1()?;  // call number
-            buf.skip_ub2()?;  // padding
-            buf.skip_ub4()?;  // success iters
+            buf.skip_ub4()?; // OS error
+            buf.skip_ub1()?; // statement number
+            buf.skip_ub1()?; // call number
+            buf.skip_ub2()?; // padding
+            buf.skip_ub4()?; // success iters
 
             // oerrdd (logical rowid)
             let oerrdd_len = buf.read_ub4()?;
@@ -3572,44 +5115,42 @@ impl Connection {
             // batch error codes array
             let num_batch_errors = buf.read_ub2()?;
             if num_batch_errors > 0 {
-                // Skip batch error data - we don't process it for now
-                buf.skip_ub1()?;  // first byte
+                buf.skip_ub1()?;
                 for _ in 0..num_batch_errors {
-                    buf.skip_ub2()?;  // error code
+                    buf.skip_ub2()?;
                 }
             }
 
             // batch error row offset array
             let num_offsets = buf.read_ub4()?;
             if num_offsets > 0 {
-                buf.skip_ub1()?;  // first byte
+                buf.skip_ub1()?;
                 for _ in 0..num_offsets {
-                    buf.skip_ub4()?;  // offset
+                    buf.skip_ub4()?;
                 }
             }
 
             // batch error messages array
             let num_batch_msgs = buf.read_ub2()?;
             if num_batch_msgs > 0 {
-                // Skip batch error messages
-                buf.skip_ub1()?;  // packed size
+                buf.skip_ub1()?;
                 for _ in 0..num_batch_msgs {
-                    buf.skip_ub2()?;  // chunk length
-                    buf.read_string_with_length()?;  // message
-                    buf.skip(2)?;  // end marker
+                    buf.skip_ub2()?;
+                    buf.read_string_with_length()?;
+                    buf.skip(2)?;
                 }
             }
 
-            // Extended error number (UB4)
-            let error_num = buf.read_ub4()?;
-            let _row_count = buf.read_ub8()?;  // row number (extended)
+            // Extended error number (UB4) + row count (UB8).
+            // Oracle 11g (ttc_field_version == 6) does not send these fields;
+            // the error message follows directly after the batch arrays. These
+            // two helpers rewind and fall back exactly as needed for both the
+            // 11g short-error layout and the modern extended-error layout.
+            let (error_num, _row_count, _read_extended_info) =
+                self.read_optional_extended_error_info(&mut buf, error_num_short, 0)?;
 
             // Read error message
-            let error_msg = if error_num != 0 {
-                buf.read_string_with_length()?.map(|s| s.trim().to_string())
-            } else {
-                None
-            };
+            let error_msg = self.read_optional_error_message(&mut buf, error_num)?;
 
             return Err(Error::OracleError {
                 code: error_num,
@@ -3625,7 +5166,7 @@ impl Connection {
     }
 
     /// Parse DML response to extract rows affected
-    fn parse_dml_response(&self, payload: &[u8]) -> Result<QueryResult> {
+    fn parse_dml_response(&self, payload: &[u8], ttc_field_version: u8) -> Result<QueryResult> {
         if payload.len() < 3 {
             return Err(Error::Protocol("DML response too short".to_string()));
         }
@@ -3647,7 +5188,8 @@ impl Connection {
             match msg_type {
                 // Error (4) - may contain error or success info
                 x if x == MessageType::Error as u8 => {
-                    let (error_code, error_msg, cid, row_count) = self.parse_error_info_with_rowcount(&mut buf)?;
+                    let (error_code, error_msg, cid, row_count) =
+                        self.parse_error_info_with_rowcount(&mut buf, ttc_field_version)?;
                     cursor_id = cid;
                     rows_affected = row_count;
                     if error_code != 0 && error_code != 1403 {
@@ -3701,15 +5243,23 @@ impl Connection {
     }
 
     /// Parse error info and return (error_code, error_msg, cursor_id, row_count)
-    fn parse_error_info_with_rowcount(&self, buf: &mut ReadBuffer) -> Result<(u32, Option<String>, u16, u64)> {
+    fn parse_error_info_with_rowcount(
+        &self,
+        buf: &mut ReadBuffer,
+        ttc_field_version: u8,
+    ) -> Result<(u32, Option<String>, u16, u64)> {
+        use crate::constants::ccap_value;
+
         // End of call status
         let _call_status = buf.read_ub4()?;
         // End to end seq#
         buf.skip_ub2()?;
-        // Current row number
-        buf.skip_ub4()?;
+        // Current row number. On Oracle 11g DML success responses this is the
+        // only row-count-like value present; newer servers also send the
+        // extended row count later in this message.
+        let current_row_number = buf.read_ub4()?;
         // Error number (short form)
-        buf.skip_ub2()?;
+        let error_num_short = buf.read_ub2()? as u32;
         // Array elem error
         buf.skip_ub2()?;
         // Array elem error
@@ -3736,7 +5286,7 @@ impl Connection {
         buf.skip_ub1()?; // skip
         buf.skip_ub4()?; // block_num
         buf.skip_ub2()?; // slot_num
-        // OS error
+                         // OS error
         buf.skip_ub4()?;
         // Statement number
         buf.skip_ub1()?;
@@ -3755,48 +5305,47 @@ impl Connection {
         // Batch error codes array
         let num_batch_errors = buf.read_ub2()?;
         if num_batch_errors > 0 {
-            buf.skip_ub1()?;  // first byte
+            buf.skip_ub1()?;
             for _ in 0..num_batch_errors {
-                buf.skip_ub2()?;  // error code
+                buf.skip_ub2()?;
             }
         }
 
         // Batch error row offset array
         let num_offsets = buf.read_ub4()?;
         if num_offsets > 0 {
-            buf.skip_ub1()?;  // first byte
+            buf.skip_ub1()?;
             for _ in 0..num_offsets {
-                buf.skip_ub4()?;  // offset
+                buf.skip_ub4()?;
             }
         }
 
         // Batch error messages array
         let num_batch_msgs = buf.read_ub2()?;
         if num_batch_msgs > 0 {
-            buf.skip_ub1()?;  // packed size
+            buf.skip_ub1()?;
             for _ in 0..num_batch_msgs {
-                buf.skip_ub2()?;  // chunk length
-                buf.read_string_with_length()?;  // message
-                buf.skip(2)?;  // end marker
+                buf.skip_ub2()?;
+                buf.read_string_with_length()?;
+                buf.skip(2)?;
             }
         }
 
-        // Extended error number (UB4)
-        let error_code = buf.read_ub4()?;
-        // Row count (UB8) - this is the rows affected!
-        let row_count = buf.read_ub8()?;
+        let (error_code, row_count, read_extended_info) = self.read_optional_extended_error_info(
+            buf,
+            error_num_short,
+            current_row_number as u64,
+        )?;
 
-        // Fields added in Oracle Database 20c (TTC field version >= 16)
-        // We always skip these since we support Oracle 20c+
-        buf.skip_ub4()?; // sql_type
-        buf.skip_ub4()?; // server_checksum
+        // sql_type + server_checksum were added in Oracle 20c; python-oracledb
+        // gates them on TNS_CCAP_FIELD_VERSION_20_1 (14).
+        if ttc_field_version >= ccap_value::FIELD_VERSION_20_1 && read_extended_info {
+            buf.skip_ub4()?; // sql_type
+            buf.skip_ub4()?; // server_checksum
+        }
 
         // Error message
-        let error_msg = if error_code != 0 {
-            buf.read_string_with_length()?.map(|s| s.trim().to_string())
-        } else {
-            None
-        };
+        let error_msg = self.read_optional_error_message(buf, error_code)?;
 
         Ok((error_code, error_msg, cursor_id, row_count))
     }
@@ -3809,7 +5358,11 @@ impl Connection {
     /// - If num_columns > 0: UB1 (skip one byte)
     /// - For each column: metadata fields
     /// - After columns: current date, dcb flags, etc.
-    fn parse_describe_info(&self, buf: &mut ReadBuffer, ttc_field_version: u8) -> Result<Vec<ColumnInfo>> {
+    fn parse_describe_info(
+        &self,
+        buf: &mut ReadBuffer,
+        ttc_field_version: u8,
+    ) -> Result<Vec<ColumnInfo>> {
         use crate::constants::ccap_value;
 
         // Skip max row size
@@ -3827,7 +5380,6 @@ impl Connection {
         let mut columns = Vec::with_capacity(num_columns);
 
         for _col_idx in 0..num_columns {
-
             // Parse column metadata per Python's _process_metadata
             let ora_type_num = buf.read_u8()?;
             buf.skip_ub1()?; // flags
@@ -3837,7 +5389,10 @@ impl Connection {
 
             buf.skip_ub4()?; // max_num_array_elements
             buf.skip_ub8()?; // cont_flags
-            let _oid = buf.read_bytes_with_length()?; // OID
+            let oid_length = buf.read_ub4()?; // OID length
+            if oid_length > 0 {
+                buf.skip_raw_bytes_chunked()?; // skip OID bytes
+            }
             buf.skip_ub2()?; // version
             buf.skip_ub2()?; // charset_id
             let _csfrm = buf.read_u8()?; // charset form
@@ -3932,7 +5487,6 @@ impl Connection {
         // After dcbqcky, the next message (RowHeader) follows directly
         // No additional fields to skip here
 
-
         Ok(columns)
     }
 
@@ -4016,7 +5570,8 @@ impl Connection {
     /// * `name` - The savepoint name to rollback to
     pub async fn rollback_to_savepoint(&self, name: &str) -> Result<()> {
         self.ensure_ready().await?;
-        self.execute(&format!("ROLLBACK TO SAVEPOINT {}", name), &[]).await?;
+        self.execute(&format!("ROLLBACK TO SAVEPOINT {}", name), &[])
+            .await?;
         Ok(())
     }
 
@@ -4059,6 +5614,24 @@ impl Connection {
         }
     }
 
+    fn extract_embedded_server_error(packet: &[u8]) -> Option<String> {
+        for needle in [b"ORA-".as_slice(), b"TNS-".as_slice()] {
+            if let Some(offset) = packet
+                .windows(needle.len())
+                .position(|window| window == needle)
+            {
+                let tail = &packet[offset..];
+                let end = tail
+                    .iter()
+                    .position(|byte| *byte == 0 || *byte == b'\n')
+                    .unwrap_or(tail.len());
+                return Some(String::from_utf8_lossy(&tail[..end]).to_string());
+            }
+        }
+
+        None
+    }
+
     /// Read data from a LOB (CLOB or BLOB)
     ///
     /// # Arguments
@@ -4074,7 +5647,11 @@ impl Connection {
 
         // Read the entire LOB starting at offset 1
         let offset = 1u64;
-        let amount = locator.size();
+        let amount = if locator.size() == 0 {
+            self.lob_length(locator).await?
+        } else {
+            locator.size()
+        };
 
         self.read_lob_internal(locator, offset, amount).await
     }
@@ -4238,6 +5815,7 @@ impl Connection {
     ) -> Result<LobData> {
         let mut inner = self.inner.lock().await;
         let large_sdu = inner.large_sdu;
+        let legacy_11g = inner.server_info.protocol_version <= version::MIN_ACCEPTED;
 
         // Create LOB operation message for read
         let mut lob_msg = LobOpMessage::new_read(locator, offset, amount);
@@ -4249,7 +5827,9 @@ impl Connection {
         inner.send(&request).await?;
 
         // Receive and parse response (may span multiple packets for large LOBs)
-        let response = inner.receive_response().await?;
+        let response = inner
+            .receive_lob_response(locator.locator_bytes().len() + 8)
+            .await?;
         if response.len() <= PACKET_HEADER_SIZE {
             return Err(Error::Protocol("Empty LOB read response".to_string()));
         }
@@ -4267,11 +5847,17 @@ impl Connection {
 
         // Parse LOB data response
         let payload = &response[PACKET_HEADER_SIZE..];
-        self.parse_lob_read_response(payload, locator)
+        self.parse_lob_read_response(payload, locator, amount, legacy_11g)
     }
 
     /// Parse LOB read response
-    fn parse_lob_read_response(&self, payload: &[u8], locator: &LobLocator) -> Result<LobData> {
+    fn parse_lob_read_response(
+        &self,
+        payload: &[u8],
+        locator: &LobLocator,
+        _amount: u64,
+        legacy_11g: bool,
+    ) -> Result<LobData> {
         use crate::buffer::ReadBuffer;
 
         let mut buf = ReadBuffer::from_slice(payload);
@@ -4289,7 +5875,11 @@ impl Connection {
                 // LobData message (14)
                 x if x == MessageType::LobData as u8 => {
                     // Read LOB data with length
-                    let data = buf.read_raw_bytes_chunked()?;
+                    let data = if legacy_11g {
+                        self.read_legacy_11g_lob_data(&mut buf)?
+                    } else {
+                        buf.read_raw_bytes_chunked()?
+                    };
                     lob_data = Some(data);
                 }
 
@@ -4297,10 +5887,25 @@ impl Connection {
                 x if x == MessageType::Parameter as u8 => {
                     // Skip the updated locator (same length as original)
                     let locator_len = locator.locator_bytes().len();
-                    buf.skip(locator_len)?;
+                    if let Err(e) = buf.skip(locator_len) {
+                        if lob_data.is_some() && matches!(e, Error::BufferUnderflow { .. }) {
+                            break;
+                        }
+                        return Err(e);
+                    }
 
                     // Read back the amount (ub8)
-                    let _returned_amount = buf.read_ub8()?;
+                    if let Err(e) = buf.read_ub8() {
+                        if lob_data.is_some()
+                            && matches!(
+                                e,
+                                Error::BufferUnderflow { .. } | Error::InvalidLengthIndicator(_)
+                            )
+                        {
+                            break;
+                        }
+                        return Err(e);
+                    }
                 }
 
                 // Error/Status message (4) - code 0 means success
@@ -4360,6 +5965,27 @@ impl Connection {
         }
     }
 
+    fn read_legacy_11g_lob_data(&self, buf: &mut ReadBuffer) -> Result<Vec<u8>> {
+        use crate::constants::length;
+
+        let length = buf.read_u8()?;
+        if length != length::LONG_INDICATOR {
+            return buf.read_bytes_vec(length as usize);
+        }
+
+        let mut data = Vec::new();
+        loop {
+            let chunk_len = buf.read_u8()? as usize;
+            if chunk_len == 0 {
+                break;
+            }
+            let chunk = buf.read_bytes_vec(chunk_len)?;
+            data.extend_from_slice(&chunk);
+        }
+
+        Ok(data)
+    }
+
     /// Write data to a LOB
     ///
     /// # Arguments
@@ -4378,10 +6004,7 @@ impl Connection {
         let write_data = if locator.is_clob() && locator.uses_var_length_charset() {
             // Convert UTF-8 to UTF-16 BE for CLOB with var length charset
             let text = String::from_utf8_lossy(data);
-            encoded_data = text
-                .encode_utf16()
-                .flat_map(|c| c.to_be_bytes())
-                .collect();
+            encoded_data = text.encode_utf16().flat_map(|c| c.to_be_bytes()).collect();
             &encoded_data[..]
         } else {
             data
@@ -4414,7 +6037,9 @@ impl Connection {
         // Use receive_response() to accumulate all packets until END_OF_RESPONSE.
         // This is necessary because Oracle may send multiple packets for the response,
         // and if we only read one packet, leftover data causes close() to hang.
-        let response = inner.receive_response().await?;
+        let response = inner
+            .receive_lob_response(locator.locator_bytes().len())
+            .await?;
         if response.len() <= PACKET_HEADER_SIZE {
             return Err(Error::Protocol("Empty LOB write response".to_string()));
         }
@@ -4582,7 +6207,9 @@ impl Connection {
         // Receive and parse response
         let response = inner.receive().await?;
         if response.len() <= PACKET_HEADER_SIZE {
-            return Err(Error::Protocol("Empty CREATE_TEMP LOB response".to_string()));
+            return Err(Error::Protocol(
+                "Empty CREATE_TEMP LOB response".to_string(),
+            ));
         }
 
         // Check for MARKER packet (indicates error)
@@ -4620,7 +6247,8 @@ impl Connection {
                 x if x == MessageType::Error as u8 => {
                     if let Ok((code, msg, _)) = self.parse_error_info(&mut buf) {
                         if code != 0 {
-                            let message = msg.unwrap_or_else(|| "CREATE_TEMP LOB error".to_string());
+                            let message =
+                                msg.unwrap_or_else(|| "CREATE_TEMP LOB error".to_string());
                             return Err(Error::OracleError { code, message });
                         }
                     }
@@ -4643,10 +6271,10 @@ impl Connection {
         // Create LobLocator with size 0, chunk_size 0 (will be fetched if needed)
         let locator = LobLocator::new(
             bytes::Bytes::from(loc_bytes),
-            0,      // size - unknown for new temp LOB
-            0,      // chunk_size - unknown, can be fetched later
+            0, // size - unknown for new temp LOB
+            0, // chunk_size - unknown, can be fetched later
             oracle_type,
-            1,      // csfrm - 1 for CLOB, 0 for BLOB (but we store it on the locator type)
+            1, // csfrm - 1 for CLOB, 0 for BLOB (but we store it on the locator type)
         );
 
         Ok(locator)
@@ -4661,7 +6289,9 @@ impl Connection {
         self.ensure_ready().await?;
 
         if !locator.is_bfile() {
-            return Err(Error::Protocol("bfile_exists called on non-BFILE locator".to_string()));
+            return Err(Error::Protocol(
+                "bfile_exists called on non-BFILE locator".to_string(),
+            ));
         }
 
         let mut inner = self.inner.lock().await;
@@ -4698,7 +6328,9 @@ impl Connection {
         self.ensure_ready().await?;
 
         if !locator.is_bfile() {
-            return Err(Error::Protocol("bfile_open called on non-BFILE locator".to_string()));
+            return Err(Error::Protocol(
+                "bfile_open called on non-BFILE locator".to_string(),
+            ));
         }
 
         let mut inner = self.inner.lock().await;
@@ -4733,7 +6365,9 @@ impl Connection {
         self.ensure_ready().await?;
 
         if !locator.is_bfile() {
-            return Err(Error::Protocol("bfile_close called on non-BFILE locator".to_string()));
+            return Err(Error::Protocol(
+                "bfile_close called on non-BFILE locator".to_string(),
+            ));
         }
 
         let mut inner = self.inner.lock().await;
@@ -4768,7 +6402,9 @@ impl Connection {
         self.ensure_ready().await?;
 
         if !locator.is_bfile() {
-            return Err(Error::Protocol("bfile_is_open called on non-BFILE locator".to_string()));
+            return Err(Error::Protocol(
+                "bfile_is_open called on non-BFILE locator".to_string(),
+            ));
         }
 
         let mut inner = self.inner.lock().await;
@@ -4804,7 +6440,9 @@ impl Connection {
     /// and returns it as bytes. For large BFILEs, consider using read_lob_chunked.
     pub async fn read_bfile(&self, locator: &LobLocator) -> Result<bytes::Bytes> {
         if !locator.is_bfile() {
-            return Err(Error::Protocol("read_bfile called on non-BFILE locator".to_string()));
+            return Err(Error::Protocol(
+                "read_bfile called on non-BFILE locator".to_string(),
+            ));
         }
 
         // Check if file is open, open if needed
@@ -5003,7 +6641,9 @@ impl Connection {
 
         if inner.state == ConnectionState::Ready {
             // Send logoff
-            let _ = self.send_simple_function_inner(&mut inner, FunctionCode::Logoff).await;
+            let _ = self
+                .send_simple_function_inner(&mut inner, FunctionCode::Logoff)
+                .await;
         }
 
         inner.state = ConnectionState::Closed;
@@ -5159,21 +6799,24 @@ impl Connection {
                                 }
 
                                 // Got a non-marker packet (probably DATA with error/status)
-                                if current_packet_type == PacketType::Data as u8 {
-                                    if pkt.len() > PACKET_HEADER_SIZE + 2 {
-                                        let msg_type = pkt[PACKET_HEADER_SIZE + 2];
-                                        if msg_type == MessageType::Error as u8 {
-                                            let payload = &pkt[PACKET_HEADER_SIZE..];
-                                            let mut buf = ReadBuffer::from_slice(payload);
-                                            buf.skip(2)?; // data flags
-                                            buf.skip(1)?; // msg_type
-                                            let (error_code, error_msg, _) = self.parse_error_info(&mut buf)?;
-                                            if error_code != 0 {
-                                                return Err(Error::OracleError {
-                                                    code: error_code,
-                                                    message: error_msg.unwrap_or_else(|| format!("ORA-{:05}", error_code)),
-                                                });
-                                            }
+                                if current_packet_type == PacketType::Data as u8
+                                    && pkt.len() > PACKET_HEADER_SIZE + 2
+                                {
+                                    let msg_type = pkt[PACKET_HEADER_SIZE + 2];
+                                    if msg_type == MessageType::Error as u8 {
+                                        let payload = &pkt[PACKET_HEADER_SIZE..];
+                                        let mut buf = ReadBuffer::from_slice(payload);
+                                        buf.skip(2)?; // data flags
+                                        buf.skip(1)?; // msg_type
+                                        let (error_code, error_msg, _) =
+                                            self.parse_error_info(&mut buf)?;
+                                        if error_code != 0 {
+                                            return Err(Error::OracleError {
+                                                code: error_code,
+                                                message: error_msg.unwrap_or_else(|| {
+                                                    format!("ORA-{:05}", error_code)
+                                                }),
+                                            });
                                         }
                                     }
                                 }
@@ -5186,10 +6829,11 @@ impl Connection {
                                 // servers close the connection after BREAK/RESET handshake.
                                 // For commit/rollback/logoff, treat this as success since
                                 // the operation was processed before the close.
-                                if matches!(function_code,
-                                    FunctionCode::Logoff |
-                                    FunctionCode::Commit |
-                                    FunctionCode::Rollback
+                                if matches!(
+                                    function_code,
+                                    FunctionCode::Logoff
+                                        | FunctionCode::Commit
+                                        | FunctionCode::Rollback
                                 ) {
                                     // The operation succeeded, but the server closed the connection
                                     // Mark connection as closed for future operations
@@ -5237,7 +6881,10 @@ impl Connection {
             return Ok(());
         }
 
-        Err(Error::Protocol(format!("Unexpected packet type {} for function call", packet_type)))
+        Err(Error::Protocol(format!(
+            "Unexpected packet type {} for function call",
+            packet_type
+        )))
     }
 
     /// Ensure the connection is ready for operations
@@ -5306,7 +6953,7 @@ fn oracle_type_from_name(type_name: &str) -> crate::constants::OracleType {
         "BOOLEAN" | "PL/SQL BOOLEAN" => OracleType::Boolean,
         "ROWID" | "UROWID" => OracleType::Rowid,
         "XMLTYPE" => OracleType::Varchar, // Treat XMLType as string for now
-        _ => OracleType::Varchar, // Default to VARCHAR for unknown types
+        _ => OracleType::Varchar,         // Default to VARCHAR for unknown types
     }
 }
 
@@ -5314,6 +6961,23 @@ fn oracle_type_from_name(type_name: &str) -> crate::constants::OracleType {
 mod tests {
     use super::*;
     use crate::row::Value;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    fn make_test_connection() -> Connection {
+        Connection {
+            inner: Arc::new(Mutex::new(ConnectionInner::new_with_cache(0))),
+            config: Config::new(
+                "localhost".to_string(),
+                1521,
+                "xe".to_string(),
+                "user".to_string(),
+                "password".to_string(),
+            ),
+            closed: AtomicBool::new(false),
+            id: 1,
+        }
+    }
 
     #[test]
     fn test_query_options_default() {
@@ -5365,6 +7029,359 @@ mod tests {
     fn test_connection_state_transitions() {
         assert_eq!(ConnectionState::Disconnected, ConnectionState::Disconnected);
         assert_ne!(ConnectionState::Connected, ConnectionState::Ready);
+    }
+
+    #[test]
+    fn test_inspect_message_stream_lob_parameter_is_complete() {
+        let inner = ConnectionInner::new_with_cache(0);
+        let data = [
+            MessageType::LobData as u8,
+            3,
+            b'a',
+            b'b',
+            b'c',
+            MessageType::Parameter as u8,
+        ];
+
+        assert_eq!(inner.inspect_message_stream(&data), (false, false));
+    }
+
+    #[test]
+    fn test_inspect_message_stream_legacy_11g_lob_chunks_are_complete() {
+        let mut inner = ConnectionInner::new_with_cache(0);
+        inner.server_info.protocol_version = 314;
+        let mut data = vec![
+            MessageType::LobData as u8,
+            crate::constants::length::LONG_INDICATOR,
+            crate::constants::length::MAX_SHORT,
+        ];
+        data.extend(std::iter::repeat(b'a').take(crate::constants::length::MAX_SHORT as usize));
+        data.push(1);
+        data.push(b'b');
+        data.push(0);
+        data.push(MessageType::Parameter as u8);
+
+        assert_eq!(inner.inspect_message_stream(&data), (false, false));
+    }
+
+    #[test]
+    fn test_inspect_message_stream_legacy_11g_lob_truncated_chunk_is_incomplete() {
+        let mut inner = ConnectionInner::new_with_cache(0);
+        inner.server_info.protocol_version = 314;
+        let data = [
+            MessageType::LobData as u8,
+            crate::constants::length::LONG_INDICATOR,
+            4,
+            b'a',
+            b'b',
+        ];
+
+        assert_eq!(inner.inspect_message_stream(&data), (false, true));
+    }
+
+    #[test]
+    fn test_inspect_message_stream_legacy_11g_split_lob_parameter_is_incomplete() {
+        let mut inner = ConnectionInner::new_with_cache(0);
+        inner.server_info.protocol_version = 314;
+        let data = [
+            MessageType::LobData as u8,
+            crate::constants::length::LONG_INDICATOR,
+            1,
+            b'a',
+            0,
+            MessageType::Parameter as u8,
+            0,
+            1,
+        ];
+
+        assert_eq!(
+            inner.inspect_message_stream_with_lob_parameter_len(&data, Some(4)),
+            (false, true)
+        );
+    }
+
+    #[test]
+    fn test_inspect_message_stream_legacy_11g_lob_parameter_then_status_is_complete() {
+        let mut inner = ConnectionInner::new_with_cache(0);
+        inner.server_info.protocol_version = 314;
+        let data = [
+            MessageType::LobData as u8,
+            crate::constants::length::LONG_INDICATOR,
+            1,
+            b'a',
+            0,
+            MessageType::Parameter as u8,
+            0,
+            1,
+            2,
+            3,
+            MessageType::Status as u8,
+        ];
+
+        assert_eq!(
+            inner.inspect_message_stream_with_lob_parameter_len(&data, Some(4)),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn test_scan_fetch_stream_status_is_terminal() {
+        let conn = make_test_connection();
+        let caps = Capabilities::default();
+        let cols = vec![ColumnInfo::new("ID", OracleType::Number)];
+        let mut state = FetchScanState::default();
+
+        assert_eq!(
+            conn.scan_fetch_message_stream(&[MessageType::Status as u8], &cols, &caps, &mut state),
+            FetchScanOutcome::Terminal
+        );
+    }
+
+    #[test]
+    fn test_scan_fetch_stream_unknown_message_falls_back() {
+        let conn = make_test_connection();
+        let caps = Capabilities::default();
+        let cols = vec![ColumnInfo::new("ID", OracleType::Number)];
+        let mut state = FetchScanState::default();
+
+        assert_eq!(
+            conn.scan_fetch_message_stream(
+                &[MessageType::Parameter as u8, 1, 2, 3],
+                &cols,
+                &caps,
+                &mut state
+            ),
+            FetchScanOutcome::Unknown
+        );
+    }
+
+    #[test]
+    fn test_scan_fetch_stream_split_row_resumes_and_terminates_on_error_message() {
+        let conn = make_test_connection();
+        let caps = Capabilities::default();
+        let cols = vec![ColumnInfo::new("ID", OracleType::Number)];
+        let mut state = FetchScanState::default();
+
+        // RowData for one NUMBER column (value 1 = c1 02), truncated after
+        // the first value byte: provably mid-message.
+        let mut data = vec![MessageType::RowData as u8, 2, 0xc1];
+        assert_eq!(
+            conn.scan_fetch_message_stream(&data, &cols, &caps, &mut state),
+            FetchScanOutcome::NeedMore
+        );
+        assert_eq!(state.scan_offset, 0);
+
+        // Complete the row: all messages parse, but the terminal Error
+        // message has not arrived yet, so the response is still incomplete.
+        data.push(0x02);
+        assert_eq!(
+            conn.scan_fetch_message_stream(&data, &cols, &caps, &mut state),
+            FetchScanOutcome::NeedMore
+        );
+        assert_eq!(state.scan_offset, data.len());
+
+        // Append a zero-filled Error message (call status 0, error 0): the
+        // terminal message completes the response.
+        data.push(MessageType::Error as u8);
+        data.extend(std::iter::repeat(0u8).take(48));
+        assert_eq!(
+            conn.scan_fetch_message_stream(&data, &cols, &caps, &mut state),
+            FetchScanOutcome::Terminal
+        );
+    }
+
+    #[test]
+    fn test_scan_fetch_stream_bit_vector_changes_row_width() {
+        let conn = make_test_connection();
+        let caps = Capabilities::default();
+        let cols = vec![
+            ColumnInfo::new("A", OracleType::Number),
+            ColumnInfo::new("B", OracleType::Number),
+        ];
+        let mut state = FetchScanState::default();
+
+        // BitVector: 2 columns sent (ub2 = [1, 2]), bit 0 set / bit 1 clear,
+        // so the following RowData carries only column A; column B is a
+        // duplicate and consumes no bytes. Status terminates the stream.
+        let data = vec![
+            MessageType::BitVector as u8,
+            1,
+            2,
+            0b0000_0001,
+            MessageType::RowData as u8,
+            2,
+            0xc1,
+            0x02,
+            MessageType::Status as u8,
+        ];
+        assert_eq!(
+            conn.scan_fetch_message_stream(&data, &cols, &caps, &mut state),
+            FetchScanOutcome::Terminal
+        );
+    }
+
+    #[test]
+    fn test_scan_fetch_stream_truncated_error_message_needs_more() {
+        let conn = make_test_connection();
+        let caps = Capabilities::default();
+        let cols = vec![ColumnInfo::new("ID", OracleType::Number)];
+        let mut state = FetchScanState::default();
+
+        // Error message truncated a few fields in: the terminal message
+        // itself is split across packets, so the response is not complete.
+        assert_eq!(
+            conn.scan_fetch_message_stream(
+                &[MessageType::Error as u8, 0, 0, 0],
+                &cols,
+                &caps,
+                &mut state
+            ),
+            FetchScanOutcome::NeedMore
+        );
+    }
+
+    #[test]
+    fn test_parse_legacy_11g_lob_read_preserves_multibyte_clob_chunk() {
+        let conn = make_test_connection();
+        let locator = LobLocator::new(Bytes::from(vec![0; 20]), 2, 0, OracleType::Clob, 1);
+        let payload = [
+            0,
+            0,
+            MessageType::LobData as u8,
+            crate::constants::length::LONG_INDICATOR,
+            4,
+            0xc3,
+            0xa9,
+            0xc3,
+            0xa9,
+            0,
+            MessageType::EndOfResponse as u8,
+        ];
+
+        let data = conn
+            .parse_lob_read_response(&payload, &locator, 2, true)
+            .unwrap();
+
+        match data {
+            LobData::String(text) => assert_eq!(text.as_bytes(), &[0xc3, 0xa9, 0xc3, 0xa9]),
+            other => panic!("Expected CLOB string, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_error_info_legacy_11g_short_layout() {
+        let conn = make_test_connection();
+        let mut payload = WriteBuffer::new();
+
+        payload.write_ub4(0).unwrap(); // call status
+        payload.write_ub2(0).unwrap(); // end-to-end sequence
+        payload.write_ub4(0).unwrap(); // current row number
+        payload.write_ub2(942).unwrap(); // short error number
+        payload.write_ub2(0).unwrap(); // array elem error
+        payload.write_ub2(0).unwrap(); // array elem error
+        payload.write_ub2(7).unwrap(); // cursor id
+        payload.write_ub2(0).unwrap(); // error position
+        payload.write_u8(0).unwrap(); // sql type
+        payload.write_u8(0).unwrap(); // fatal
+        payload.write_u8(0).unwrap(); // flags
+        payload.write_u8(0).unwrap(); // user cursor options
+        payload.write_u8(0).unwrap(); // UPI parameter
+        payload.write_u8(0).unwrap(); // second flags
+        payload.write_ub4(0).unwrap(); // rowid rba
+        payload.write_ub2(0).unwrap(); // rowid partition
+        payload.write_u8(0).unwrap(); // rowid skip
+        payload.write_ub4(0).unwrap(); // rowid block
+        payload.write_ub2(0).unwrap(); // rowid slot
+        payload.write_ub4(0).unwrap(); // OS error
+        payload.write_u8(0).unwrap(); // statement number
+        payload.write_u8(0).unwrap(); // call number
+        payload.write_ub2(0).unwrap(); // padding
+        payload.write_ub4(0).unwrap(); // success iters
+        payload.write_ub4(0).unwrap(); // logical rowid length
+        payload.write_ub2(0).unwrap(); // batch error count
+        payload.write_ub4(0).unwrap(); // batch offset count
+        payload.write_ub2(0).unwrap(); // batch message count
+        payload
+            .write_string_with_length(Some("ORA-00942: table or view does not exist\n"))
+            .unwrap();
+
+        let bytes = payload.freeze();
+        let mut buf = ReadBuffer::from_slice(&bytes);
+        let (code, message, cursor_id) = conn.parse_error_info(&mut buf).unwrap();
+
+        assert_eq!(code, 942);
+        assert_eq!(cursor_id, 7);
+        assert_eq!(
+            message.as_deref(),
+            Some("ORA-00942: table or view does not exist")
+        );
+    }
+
+    #[test]
+    fn test_parse_fetch_error_info_legacy_11g_short_layout() {
+        let conn = make_test_connection();
+        let mut payload = WriteBuffer::new();
+
+        payload.write_ub4(0).unwrap(); // call status
+        payload.write_ub2(0).unwrap(); // end-to-end sequence
+        payload.write_ub4(0).unwrap(); // current row number
+        payload.write_ub2(1403).unwrap(); // short error number
+        payload.write_ub2(0).unwrap(); // array elem error
+        payload.write_ub2(0).unwrap(); // array elem error
+        payload.write_ub2(7).unwrap(); // cursor id
+        payload.write_ub2(0).unwrap(); // error position
+        payload.write_u8(0).unwrap(); // sql type
+        payload.write_u8(0).unwrap(); // fatal
+        payload.write_u8(0).unwrap(); // flags
+        payload.write_u8(0).unwrap(); // user cursor options
+        payload.write_u8(0).unwrap(); // UPI parameter
+        payload.write_u8(0).unwrap(); // second flags
+        payload.write_ub4(0).unwrap(); // rowid rba
+        payload.write_ub2(0).unwrap(); // rowid partition
+        payload.write_u8(0).unwrap(); // rowid skip
+        payload.write_ub4(0).unwrap(); // rowid block
+        payload.write_ub2(0).unwrap(); // rowid slot
+        payload.write_ub4(0).unwrap(); // OS error
+        payload.write_u8(0).unwrap(); // statement number
+        payload.write_u8(0).unwrap(); // call number
+        payload.write_ub2(0).unwrap(); // padding
+        payload.write_ub4(0).unwrap(); // success iters
+        payload.write_ub4(0).unwrap(); // logical rowid length
+        payload.write_ub2(0).unwrap(); // batch error count
+        payload.write_ub4(0).unwrap(); // batch offset count
+        payload.write_ub2(0).unwrap(); // batch message count
+        payload
+            .write_string_with_length(Some("ORA-01403: no data found\n"))
+            .unwrap();
+
+        let bytes = payload.freeze();
+        let mut buf = ReadBuffer::from_slice(&bytes);
+        let (code, message, cursor_id, more_rows) = conn
+            .parse_error_message_info(&mut buf, crate::constants::ccap_value::FIELD_VERSION_11_2)
+            .unwrap();
+
+        assert_eq!(code, 1403);
+        assert_eq!(cursor_id, 7);
+        assert!(!more_rows);
+        assert_eq!(message, "ORA-01403: no data found");
+    }
+
+    #[test]
+    fn test_parse_legacy_11g_query_response_from_capture() {
+        let conn = make_test_connection();
+        let mut caps = Capabilities::new();
+        caps.ttc_field_version = crate::constants::ccap_value::FIELD_VERSION_11_2;
+        let payload = hex::decode(
+            "0000101700000017e75ddbb9ab3c0d227d53bda738ea01787e0401082a030200000001000000510200008102000000000000000000000000000000000000000000000000010101000000013100000000000000000000000000000700000007787e04010b142300000000e81f0000020000000200000000000000062201000000000002000000000000000000000000000702c10208060053480600000000000200000000000000000000000000000000000100000000000b0000000b80000000453c3c80000000a3000000000004010000000400010000007b050000000002000e00030000000000000000000000000000000000000000000000030000010000000000000000000000000000000000194f52412d30313430333a206e6f206461746120666f756e640a",
+        )
+        .unwrap();
+
+        let result = conn.parse_query_response(&payload, &caps).unwrap();
+
+        assert_eq!(result.columns.len(), 1);
+        assert_eq!(result.columns[0].name, "1");
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].get_string(0), Some("1"));
     }
 
     #[test]

@@ -5,7 +5,10 @@
 
 use crate::buffer::WriteBuffer;
 use crate::capabilities::Capabilities;
-use crate::constants::{charset, lob_duration, lob_op, FunctionCode, MessageType, OracleType, PacketType, PACKET_HEADER_SIZE};
+use crate::constants::{
+    charset, length, lob_duration, lob_op, FunctionCode, MessageType, OracleType, PacketType,
+    PACKET_HEADER_SIZE,
+};
 use crate::error::Result;
 use crate::types::LobLocator;
 use bytes::Bytes;
@@ -373,7 +376,11 @@ impl<'a> LobOpMessage<'a> {
         // Write data for write operations
         if let Some(data) = self.write_data {
             buf.write_u8(MessageType::LobData as u8)?;
-            buf.write_bytes_with_length(Some(data))?;
+            if caps.is_legacy_11g_ttc() {
+                Self::write_legacy_11g_lob_data(buf, data)?;
+            } else {
+                buf.write_bytes_with_length(Some(data))?;
+            }
         }
 
         // Write amount if needed
@@ -382,6 +389,24 @@ impl<'a> LobOpMessage<'a> {
         }
 
         Ok(())
+    }
+
+    fn write_legacy_11g_lob_data(buf: &mut WriteBuffer, data: &[u8]) -> Result<()> {
+        if data.is_empty() {
+            return buf.write_u8(0);
+        }
+
+        if data.len() <= length::MAX_SHORT as usize {
+            buf.write_u8(data.len() as u8)?;
+            return buf.write_bytes(data);
+        }
+
+        buf.write_u8(length::LONG_INDICATOR)?;
+        for chunk in data.chunks(length::MAX_SHORT as usize) {
+            buf.write_u8(chunk.len() as u8)?;
+            buf.write_bytes(chunk)?;
+        }
+        buf.write_u8(0)
     }
 }
 
@@ -433,5 +458,19 @@ mod tests {
         assert_eq!(msg.operation, lob_op::TRIM);
         assert_eq!(msg.amount, 50);
         assert!(msg.send_amount);
+    }
+
+    #[test]
+    fn test_legacy_11g_lob_data_avoids_reserved_chunk_length() {
+        let data = vec![0x41; length::MAX_SHORT as usize + 1];
+        let mut buf = WriteBuffer::new();
+
+        LobOpMessage::write_legacy_11g_lob_data(&mut buf, &data).unwrap();
+
+        let encoded = buf.freeze();
+        assert_eq!(encoded[0], length::LONG_INDICATOR);
+        assert_eq!(encoded[1], length::MAX_SHORT);
+        assert_eq!(encoded[length::MAX_SHORT as usize + 2], 1);
+        assert_eq!(encoded[length::MAX_SHORT as usize + 4], 0);
     }
 }

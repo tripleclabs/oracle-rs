@@ -98,7 +98,8 @@ mod protocol_message_tests {
     #[test]
     fn test_protocol_request_structure() {
         let msg = ProtocolMessage::new();
-        let packet = msg.build_request(false).unwrap();
+        let caps = Capabilities::new();
+        let packet = msg.build_request(&caps, false).unwrap();
 
         // Verify packet header
         assert!(packet.len() > PACKET_HEADER_SIZE);
@@ -216,8 +217,10 @@ mod data_types_message_tests {
         assert_eq!(packet[PACKET_HEADER_SIZE + 2], MessageType::DataTypes as u8);
 
         // Verify charset IDs (little-endian)
-        let charset1 =
-            u16::from_le_bytes([packet[PACKET_HEADER_SIZE + 3], packet[PACKET_HEADER_SIZE + 4]]);
+        let charset1 = u16::from_le_bytes([
+            packet[PACKET_HEADER_SIZE + 3],
+            packet[PACKET_HEADER_SIZE + 4],
+        ]);
         assert_eq!(charset1, charset::UTF8);
     }
 
@@ -277,7 +280,7 @@ mod capabilities_negotiation_flow {
 
         // Step 2: Build and send Protocol request
         let proto_msg = ProtocolMessage::new();
-        let proto_request = proto_msg.build_request(false).unwrap();
+        let proto_request = proto_msg.build_request(&caps, false).unwrap();
         assert!(!proto_request.is_empty());
 
         // Step 3: Parse Protocol response from server
@@ -297,7 +300,9 @@ mod capabilities_negotiation_flow {
         );
 
         let mut proto_msg = ProtocolMessage::new();
-        proto_msg.parse_response(&proto_response, &mut caps).unwrap();
+        proto_msg
+            .parse_response(&proto_response, &mut caps)
+            .unwrap();
 
         // Verify capabilities were updated
         assert_eq!(caps.charset_id, charset::UTF8);
@@ -346,7 +351,9 @@ mod capabilities_negotiation_flow {
         );
 
         let mut proto_msg = ProtocolMessage::new();
-        proto_msg.parse_response(&proto_response, &mut caps).unwrap();
+        proto_msg
+            .parse_response(&proto_response, &mut caps)
+            .unwrap();
 
         // Verify older field version
         assert_eq!(caps.ttc_field_version, ccap_value::FIELD_VERSION_12_2);
@@ -358,7 +365,11 @@ mod capabilities_negotiation_flow {
     #[test]
     fn test_ncharset_negotiation() {
         let mut caps = Capabilities::new();
-        caps.adjust_for_protocol(319, service_options::CAN_RECV_ATTENTION, accept_flags::FAST_AUTH);
+        caps.adjust_for_protocol(
+            319,
+            service_options::CAN_RECV_ATTENTION,
+            accept_flags::FAST_AUTH,
+        );
 
         // Valid UTF-16 NCHAR charset
         caps.ncharset_id = charset::UTF16;
@@ -419,7 +430,8 @@ mod packet_header_integration {
     #[test]
     fn test_protocol_packet_header_validation() {
         let msg = ProtocolMessage::new();
-        let packet = msg.build_request(false).unwrap();
+        let caps = Capabilities::new();
+        let packet = msg.build_request(&caps, false).unwrap();
 
         // Parse the header back
         let header = PacketHeader::parse(&packet).unwrap();

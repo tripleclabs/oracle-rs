@@ -247,10 +247,7 @@ mod tests {
     #[test]
     fn test_oracle_error_display() {
         let err = Error::oracle(1017, "invalid username/password");
-        assert_eq!(
-            err.to_string(),
-            "ORA-01017: invalid username/password"
-        );
+        assert_eq!(err.to_string(), "ORA-01017: invalid username/password");
     }
 
     #[test]

@@ -82,10 +82,7 @@ fn test_buffer_multiple_values() {
     assert_eq!(read_buf.read_u16_be().unwrap(), 0x1234);
     assert_eq!(read_buf.read_u32_be().unwrap(), 0xDEADBEEF);
     assert_eq!(read_buf.read_ub2().unwrap(), 300);
-    assert_eq!(
-        read_buf.read_string_with_length().unwrap().unwrap(),
-        "test"
-    );
+    assert_eq!(read_buf.read_string_with_length().unwrap().unwrap(), "test");
     assert_eq!(read_buf.read_u8().unwrap(), 0xFF);
     assert_eq!(read_buf.remaining(), 0);
 }

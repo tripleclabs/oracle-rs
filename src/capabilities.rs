@@ -4,8 +4,7 @@
 //! that are negotiated between client and server during connection establishment.
 
 use crate::constants::{
-    accept_flags, ccap_index, ccap_value, charset, rcap_index, rcap_value, service_options,
-    version,
+    accept_flags, ccap_index, ccap_value, charset, rcap_index, rcap_value, service_options, version,
 };
 
 /// Driver name sent during protocol negotiation
@@ -147,6 +146,49 @@ impl Capabilities {
         self.runtime_caps[TTC] = TTC_ZERO_COPY | TTC_32K;
     }
 
+    fn apply_legacy_11g_profile(&mut self) {
+        use ccap_index::*;
+        use ccap_value::*;
+        use rcap_index::*;
+        use rcap_value::*;
+
+        // Do NOT downgrade FIELD_VERSION to 6 (FIELD_VERSION_11_2).
+        // The server already provided its FIELD_VERSION in the protocol
+        // negotiation response, and adjust_for_server_compile_caps() has
+        // already set ttc_field_version = min(client, server).
+        //
+        // Keeping the client's FIELD_VERSION above 6 is essential because
+        // a value of 6 tells the 11g server to use the OCI "thick" wire
+        // format (8-byte pointers, fixed LE integers), which is incompatible
+        // with the thin TTC encoding that oracle-rs uses everywhere else.
+        //
+        // go-ora (a pure-Go driver proven to work with 11g) sends
+        // FIELD_VERSION = 11 and the server accepts thin-encoded messages.
+
+        // Cap the advertised FIELD_VERSION to a value Oracle 11g
+        // understands.  go-ora uses 11 and works; 24 is too far ahead
+        // for the 11g parser and causes ORA-03120.
+        // Cap FIELD_VERSION to match what go-ora sends (11).  The
+        // init_compile_caps default (FIELD_VERSION_MAX = 24) is too high
+        // for Oracle 11g to parse correctly.
+        self.compile_caps[FIELD_VERSION] = 11;
+
+        // Disable features that did not exist in 11g
+        self.compile_caps[LOB] &= !LOB_12C;
+        self.compile_caps[SESS_SIGNATURE_VERSION] = 0;
+        self.compile_caps[LOB2] = 0;
+        self.compile_caps[TTC3] = 0;
+        self.compile_caps[TTC4] &= !(EXPLICIT_BOUNDARY | END_OF_REQUEST);
+        self.compile_caps[TTC5] = 0;
+        self.compile_caps[VECTOR_FEATURES] = 0;
+
+        self.runtime_caps[TTC] = TTC_ZERO_COPY;
+        self.max_string_size = 4000;
+        self.supports_end_of_response = false;
+        self.supports_pipelining = false;
+        self.supports_request_boundaries = false;
+    }
+
     /// Adjust capabilities based on ACCEPT packet response
     pub fn adjust_for_protocol(
         &mut self,
@@ -177,20 +219,31 @@ impl Capabilities {
 
     /// Adjust capabilities based on server's compile-time capabilities
     pub fn adjust_for_server_compile_caps(&mut self, server_caps: &[u8]) {
-        // Adjust field version to minimum of client and server
+        // Record the server's field version for conditional logic (e.g.
+        // skipping 12.2+ fields in execute responses).  However, do NOT
+        // propagate the downgrade into compile_caps — the advertised
+        // FIELD_VERSION sent to the server during TTIDTY must remain at the
+        // client's original (high) value so the server selects the thin TTC
+        // encoding, not the legacy OCI thick encoding.
         if server_caps.len() > ccap_index::FIELD_VERSION {
             let server_version = server_caps[ccap_index::FIELD_VERSION];
             if server_version < self.ttc_field_version {
                 self.ttc_field_version = server_version;
-                self.compile_caps[ccap_index::FIELD_VERSION] = server_version;
             }
         }
 
+        if self.protocol_version <= crate::constants::version::MIN_ACCEPTED {
+            self.apply_legacy_11g_profile();
+            // Do NOT return early — let the remaining checks run so that
+            // end_of_response / boundary support is correctly disabled.
+        }
+
         // Check for explicit boundary support
-        if server_caps.len() > ccap_index::TTC4 {
-            if (server_caps[ccap_index::TTC4] & ccap_value::EXPLICIT_BOUNDARY) != 0 {
-                self.supports_request_boundaries = true;
-            }
+        if self.protocol_version > crate::constants::version::MIN_ACCEPTED
+            && server_caps.len() > ccap_index::TTC4
+            && (server_caps[ccap_index::TTC4] & ccap_value::EXPLICIT_BOUNDARY) != 0
+        {
+            self.supports_request_boundaries = true;
         }
 
         // Disable end of response if field version is too old
@@ -203,6 +256,12 @@ impl Capabilities {
 
     /// Adjust capabilities based on server's runtime capabilities
     pub fn adjust_for_server_runtime_caps(&mut self, server_caps: &[u8]) {
+        if self.is_legacy_11g_protocol() {
+            self.max_string_size = 4000;
+            self.supports_request_boundaries = false;
+            return;
+        }
+
         // Check max string size
         if server_caps.len() > rcap_index::TTC {
             if (server_caps[rcap_index::TTC] & rcap_value::TTC_32K) != 0 {
@@ -237,6 +296,29 @@ impl Capabilities {
     /// Check if we support large OSON field names (Oracle 23.1+)
     pub fn supports_large_oson_fname(&self) -> bool {
         self.ttc_field_version >= ccap_value::FIELD_VERSION_23_1
+    }
+
+    /// Whether the server requires the legacy Oracle 11g TTC wire layout,
+    /// keyed off the negotiated `ttc_field_version`.
+    ///
+    /// `FIELD_VERSION_11_2` (6) is the lowest value defined in
+    /// [`ccap_value`](crate::constants::ccap_value), so `<= FIELD_VERSION_11_2`
+    /// and `== FIELD_VERSION_11_2` are currently equivalent. `<=` is chosen as
+    /// the canonical, forward-safe form. This consolidates the predicate that
+    /// was previously hand-rolled with `==`, `<=`, `!=`, and `>` semantics
+    /// across auth, execute, lob_op, data_types, and connection.
+    pub fn is_legacy_11g_ttc(&self) -> bool {
+        self.ttc_field_version <= ccap_value::FIELD_VERSION_11_2
+    }
+
+    /// Whether the negotiated protocol version corresponds to a legacy Oracle
+    /// 11g server (TNS `MIN_ACCEPTED` = 314, the oldest version we accept).
+    ///
+    /// The `!= 0` guard matches the idiom already used in
+    /// [`Self::adjust_for_server_runtime_caps`]: a `protocol_version` of 0 means
+    /// "not yet negotiated" and must not be treated as legacy.
+    pub fn is_legacy_11g_protocol(&self) -> bool {
+        self.protocol_version != 0 && self.protocol_version <= version::MIN_ACCEPTED
     }
 }
 
@@ -314,6 +396,8 @@ mod tests {
     #[test]
     fn test_adjust_for_server_compile_caps() {
         let mut caps = Capabilities::new();
+        caps.protocol_version = 319;
+        let client_field_version = caps.compile_caps[ccap_index::FIELD_VERSION];
 
         // Server has lower field version
         let mut server_caps = vec![0; ccap_index::MAX];
@@ -324,7 +408,7 @@ mod tests {
         assert_eq!(caps.ttc_field_version, ccap_value::FIELD_VERSION_12_2);
         assert_eq!(
             caps.compile_caps[ccap_index::FIELD_VERSION],
-            ccap_value::FIELD_VERSION_12_2
+            client_field_version
         );
     }
 
@@ -339,6 +423,36 @@ mod tests {
         caps.adjust_for_server_runtime_caps(&server_caps);
 
         assert_eq!(caps.max_string_size, 32767);
+    }
+
+    #[test]
+    fn test_legacy_11g_runtime_caps_keep_4k_strings() {
+        let mut caps = Capabilities::new();
+        caps.adjust_for_protocol(version::MIN_ACCEPTED, 0, 0);
+
+        let mut server_ccaps = vec![0; ccap_index::MAX];
+        server_ccaps[ccap_index::FIELD_VERSION] = ccap_value::FIELD_VERSION_11_2;
+        caps.adjust_for_server_compile_caps(&server_ccaps);
+
+        let mut server_rcaps = vec![0; rcap_index::MAX];
+        server_rcaps[rcap_index::TTC] = rcap_value::TTC_32K;
+        caps.adjust_for_server_runtime_caps(&server_rcaps);
+
+        assert_eq!(caps.max_string_size, 4000);
+        assert_eq!(
+            caps.runtime_caps[rcap_index::TTC],
+            rcap_value::TTC_ZERO_COPY
+        );
+        assert_eq!(caps.compile_caps[ccap_index::LOB] & ccap_value::LOB_12C, 0);
+        assert_eq!(caps.compile_caps[ccap_index::TTC3], 0);
+        assert_eq!(
+            caps.compile_caps[ccap_index::TTC4]
+                & (ccap_value::EXPLICIT_BOUNDARY | ccap_value::END_OF_REQUEST),
+            0
+        );
+        assert_eq!(caps.compile_caps[ccap_index::LOB2], 0);
+        assert_eq!(caps.compile_caps[ccap_index::TTC5], 0);
+        assert!(!caps.supports_request_boundaries);
     }
 
     #[test]

@@ -193,6 +193,8 @@ impl TryFrom<u8> for MessageType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum FunctionCode {
+    /// Get Oracle version-date string in new format
+    VersionNewFormat = 59,
     /// Reexecute previous statement
     Reexecute = 4,
     /// Fetch rows
@@ -270,8 +272,8 @@ pub mod version {
     pub const DESIRED: u16 = 319;
     /// Minimum protocol version we support
     pub const MINIMUM: u16 = 300;
-    /// Minimum accepted version (Oracle 12.1)
-    pub const MIN_ACCEPTED: u16 = 315;
+    /// Minimum accepted version (Oracle 11g Release 2 / TNS 314)
+    pub const MIN_ACCEPTED: u16 = 314;
     /// Minimum version supporting large SDU
     pub const MIN_LARGE_SDU: u16 = 315;
     /// Minimum version supporting OOB check
@@ -425,6 +427,7 @@ pub mod ccap_value {
     pub const FIELD_VERSION_12_2: u8 = 8;
     pub const FIELD_VERSION_18_1: u8 = 10;
     pub const FIELD_VERSION_19_1: u8 = 12;
+    pub const FIELD_VERSION_20_1: u8 = 14;
     pub const FIELD_VERSION_21_1: u8 = 16;
     pub const FIELD_VERSION_23_1: u8 = 17;
     pub const FIELD_VERSION_23_4: u8 = 24;
@@ -677,7 +680,11 @@ impl OracleType {
     pub fn is_lob(&self) -> bool {
         matches!(
             self,
-            OracleType::Clob | OracleType::Blob | OracleType::Bfile | OracleType::Json | OracleType::Vector
+            OracleType::Clob
+                | OracleType::Blob
+                | OracleType::Bfile
+                | OracleType::Json
+                | OracleType::Vector
         )
     }
 
@@ -793,8 +800,9 @@ impl TryFrom<u8> for BindDirection {
     type Error = crate::error::Error;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
-        BindDirection::from_wire(value)
-            .ok_or_else(|| crate::error::Error::Protocol(format!("Invalid bind direction: {}", value)))
+        BindDirection::from_wire(value).ok_or_else(|| {
+            crate::error::Error::Protocol(format!("Invalid bind direction: {}", value))
+        })
     }
 }
 
@@ -889,8 +897,8 @@ pub mod obj_flags {
     pub const TOID_PREFIX: [u8; 2] = [0x00, 0x22];
     /// Extent OID (16 bytes) - appended to TOID after type OID
     pub const EXTENT_OID: [u8; 16] = [
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
+        0x01,
     ];
 }
 

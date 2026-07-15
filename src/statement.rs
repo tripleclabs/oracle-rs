@@ -140,7 +140,7 @@ impl BindParam {
     pub fn output_collection(obj_type: &crate::dbobject::DbObjectType) -> Self {
         use crate::dbobject::DbObject;
         // Create a placeholder collection with the type info
-        let mut placeholder = DbObject::collection(&obj_type.full_name());
+        let mut placeholder = DbObject::collection(obj_type.full_name());
         placeholder.set("_type_schema", Value::String(obj_type.schema.clone()));
         placeholder.set("_type_name", Value::String(obj_type.name.clone()));
         if let Some(elem_type) = obj_type.element_type {
@@ -178,7 +178,7 @@ impl BindParam {
         use crate::constants::collection_type;
         use crate::dbobject::{CollectionType, DbObject};
         // Create a collection with both elements and type info
-        let mut coll = DbObject::collection(&obj_type.full_name());
+        let mut coll = DbObject::collection(obj_type.full_name());
         // Copy elements
         coll.elements = collection.elements;
         // Add type metadata
@@ -638,22 +638,21 @@ impl Statement {
             }
 
             // Check for RETURNING keyword (for DML)
-            if self.statement_type == StatementType::Dml && !returning_found {
-                if self.match_keyword(&chars_upper, i, "RETURNING") {
-                    returning_found = true;
-                    i += 9;
-                    continue;
-                }
+            if self.statement_type == StatementType::Dml
+                && !returning_found
+                && self.match_keyword(&chars_upper, i, "RETURNING")
+            {
+                returning_found = true;
+                i += 9;
+                continue;
             }
 
             // Check for INTO keyword (after RETURNING)
-            if returning_found && !into_found {
-                if self.match_keyword(&chars_upper, i, "INTO") {
-                    into_found = true;
-                    self.is_returning = true;
-                    i += 4;
-                    continue;
-                }
+            if returning_found && !into_found && self.match_keyword(&chars_upper, i, "INTO") {
+                into_found = true;
+                self.is_returning = true;
+                i += 4;
+                continue;
             }
 
             // Parse bind variable
