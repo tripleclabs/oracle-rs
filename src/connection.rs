@@ -4640,9 +4640,21 @@ impl Connection {
                 // Decode based on oracle type
                 match col.oracle_type {
                     OracleType::Number => {
-                        // Oracle NUMBER format - decode to string
+                        // Preserve NUMBER as a typed value carrying its exact
+                        // decimal text, so callers can choose an integer or
+                        // decimal representation without re-parsing a String.
                         let num = crate::types::decode_oracle_number(&bytes)?;
-                        Ok(Value::String(num.value))
+                        Ok(Value::Number(num))
+                    }
+                    OracleType::BinaryFloat => {
+                        Ok(Value::Float(crate::types::decode_binary_float(&bytes) as f64))
+                    }
+                    OracleType::BinaryDouble => {
+                        Ok(Value::Float(crate::types::decode_binary_double(&bytes)))
+                    }
+                    OracleType::Boolean => {
+                        // Oracle encodes BOOLEAN as its trailing byte: 1 = true.
+                        Ok(Value::Boolean(bytes.last().copied().unwrap_or(0) == 1))
                     }
                     OracleType::Varchar | OracleType::Char | OracleType::Long => {
                         let s = String::from_utf8_lossy(&bytes).to_string();
