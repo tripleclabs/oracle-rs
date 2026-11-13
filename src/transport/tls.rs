@@ -14,9 +14,9 @@ use std::sync::Arc;
 
 use pkcs8::EncryptedPrivateKeyInfo;
 use pkcs8::SecretDocument;
+use rustls::pki_types::pem::{self, PemObject};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
-use rustls_pemfile::{certs, private_key};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
@@ -266,7 +266,9 @@ fn load_certs_from_file(path: &str) -> Result<Vec<CertificateDer<'static>>> {
         .map_err(|e| Error::Internal(format!("Failed to open cert file {}: {}", path, e)))?;
     let mut reader = BufReader::new(file);
 
-    let certs: Vec<CertificateDer<'static>> = certs(&mut reader).filter_map(|r| r.ok()).collect();
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_reader_iter(&mut reader)
+        .filter_map(|r| r.ok())
+        .collect();
 
     if certs.is_empty() {
         return Err(Error::Internal(format!(
@@ -284,9 +286,22 @@ fn load_private_key_from_file(path: &str) -> Result<PrivateKeyDer<'static>> {
         .map_err(|e| Error::Internal(format!("Failed to open key file {}: {}", path, e)))?;
     let mut reader = BufReader::new(file);
 
-    private_key(&mut reader)
+    read_private_key(&mut reader)
         .map_err(|e| Error::Internal(format!("Failed to parse key file {}: {}", path, e)))?
         .ok_or_else(|| Error::Internal(format!("No private key found in {}", path)))
+}
+
+/// Reads the first private key (PKCS#1, PKCS#8 or SEC1) from PEM input.
+/// `Ok(None)` when the input holds no key, so callers can tell "missing" from
+/// "malformed".
+fn read_private_key(
+    reader: &mut dyn std::io::BufRead,
+) -> std::result::Result<Option<PrivateKeyDer<'static>>, pem::Error> {
+    match PrivateKeyDer::from_pem_reader(reader) {
+        Ok(key) => Ok(Some(key)),
+        Err(pem::Error::NoItemsFound) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// Load certificates from an Oracle wallet directory
@@ -374,13 +389,13 @@ fn load_private_key_from_wallet(
         let der_bytes = decrypted_doc.as_bytes().to_vec();
         Ok(Some(PrivateKeyDer::Pkcs8(der_bytes.into())))
     } else {
-        // Try unencrypted key using standard rustls_pemfile
+        // Try an unencrypted key with the standard PEM reader
         let file = File::open(&pem_path)
             .map_err(|e| Error::Internal(format!("Failed to open wallet: {}", e)))?;
         let mut reader = BufReader::new(file);
 
-        Ok(private_key(&mut reader)
-            .map_err(|e| Error::Internal(format!("Failed to parse wallet key: {}", e)))?)
+        read_private_key(&mut reader)
+            .map_err(|e| Error::Internal(format!("Failed to parse wallet key: {}", e)))
     }
 }
 
@@ -498,5 +513,84 @@ mod tests {
     fn test_danger_accept_invalid_certs() {
         let config = TlsConfig::new().danger_accept_invalid_certs();
         assert!(!config.verify_server);
+    }
+
+    // A throwaway self-signed P-256 certificate and its PKCS#8 key, used only
+    // to exercise PEM loading. Not a secret: it protects nothing.
+    const TEST_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBaDCCAQ6gAwIBAgIUAVXpikMbO0keIizrb86wMmhr3O4wCgYIKoZIzj0EAwIw
+GTEXMBUGA1UEAwwOb3JhY2xlLXJzLXRlc3QwIBcNMjYxMTEzMTIzMjE4WhgPMjEy
+NjEwMjAxMjMyMThaMBkxFzAVBgNVBAMMDm9yYWNsZS1ycy10ZXN0MFkwEwYHKoZI
+zj0CAQYIKoZIzj0DAQcDQgAEGHV55GSO5WsSrrHxsGluoVTB+f2g3CidhPiBfvD/
+27CIqB1FotKDLBuwGAR82ogv9u9vskc2CF26H/DDx9lkoaMyMDAwHQYDVR0OBBYE
+FFUviwDGsWSjhLBZqbjTKbJ3NTiOMA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0E
+AwIDSAAwRQIhAPBOZUn02i1Ds3Qk+tmBoylA0lSbjAE1yG74t32dYSkZAiAyiK2+
++FyQAI71v3fYX5iD+BOG273OagiRv6BsPe2ERQ==
+-----END CERTIFICATE-----
+";
+    const TEST_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgjABLjxKw2n+FWXPh
+jbtvgIcN7duTF0QWFryODEb08EGhRANCAAQYdXnkZI7laxKusfGwaW6hVMH5/aDc
+KJ2E+IF+8P/bsIioHUWi0oMsG7AYBHzaiC/272+yRzYIXbof8MPH2WSh
+-----END PRIVATE KEY-----
+";
+
+    /// Writes `contents` to a fresh file in the temp dir and returns its path.
+    fn temp_pem(name: &str, contents: &str) -> String {
+        let path =
+            std::env::temp_dir().join(format!("oracle-rs-tls-{}-{}.pem", std::process::id(), name));
+        fs::write(&path, contents).unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn test_load_certs_from_pem_file() {
+        let path = temp_pem("certs", TEST_CERT_PEM);
+        let certs = load_certs_from_file(&path).unwrap();
+        assert_eq!(certs.len(), 1);
+        // Skips the key block in a combined file, as before.
+        let combined = temp_pem("combined", &format!("{TEST_KEY_PEM}{TEST_CERT_PEM}"));
+        assert_eq!(load_certs_from_file(&combined).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_load_certs_rejects_file_without_certs() {
+        let path = temp_pem("no-certs", TEST_KEY_PEM);
+        let error = load_certs_from_file(&path).unwrap_err().to_string();
+        assert!(error.contains("No certificates found"), "{error}");
+    }
+
+    #[test]
+    fn test_load_private_key_from_pem_file() {
+        let path = temp_pem("key", TEST_KEY_PEM);
+        let key = load_private_key_from_file(&path).unwrap();
+        assert!(matches!(key, PrivateKeyDer::Pkcs8(_)));
+    }
+
+    #[test]
+    fn test_load_private_key_rejects_file_without_key() {
+        let path = temp_pem("no-key", TEST_CERT_PEM);
+        let error = load_private_key_from_file(&path).unwrap_err().to_string();
+        assert!(error.contains("No private key found"), "{error}");
+    }
+
+    #[test]
+    fn test_unencrypted_wallet_key_is_optional() {
+        let dir = std::env::temp_dir().join(format!("oracle-rs-wallet-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let wallet = dir.to_str().unwrap();
+
+        fs::write(dir.join("ewallet.pem"), TEST_CERT_PEM).unwrap();
+        assert!(load_private_key_from_wallet(wallet, None)
+            .unwrap()
+            .is_none());
+
+        fs::write(
+            dir.join("ewallet.pem"),
+            format!("{TEST_CERT_PEM}{TEST_KEY_PEM}"),
+        )
+        .unwrap();
+        let key = load_private_key_from_wallet(wallet, None).unwrap();
+        assert!(matches!(key, Some(PrivateKeyDer::Pkcs8(_))));
     }
 }
