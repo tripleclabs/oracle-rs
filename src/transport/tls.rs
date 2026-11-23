@@ -575,6 +575,22 @@ KJ2E+IF+8P/bsIioHUWi0oMsG7AYBHzaiC/272+yRzYIXbof8MPH2WSh
     }
 
     #[test]
+    fn test_read_private_key_rejects_malformed_key() {
+        // A key block that is present but broken is an error, not "no key".
+        let bad_base64 =
+            "-----BEGIN PRIVATE KEY-----\n!!!not base64!!!\n-----END PRIVATE KEY-----\n";
+        assert!(read_private_key(&mut bad_base64.as_bytes()).is_err());
+
+        let without_end = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEH\n";
+        assert!(read_private_key(&mut without_end.as_bytes()).is_err());
+
+        // Certificate-only input is the "no key" control.
+        assert!(read_private_key(&mut TEST_CERT_PEM.as_bytes())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn test_unencrypted_wallet_key_is_optional() {
         let dir = std::env::temp_dir().join(format!("oracle-rs-wallet-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
